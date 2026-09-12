@@ -20,41 +20,59 @@ let aborted = false;
 /** 已加载模型缓存：key = `${model}|${device}|${dtype}` */
 const pipelineCache = new Map<string, AnyFn>();
 
-/** 依次尝试的 transformers.js 加载地址，第一个成功即用。 */
-const TRANSFORMERS_SOURCES = [
-  // 国内可直连的 npm CDN
-  'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3',
-  // 备用 CDN
-  'https://esm.sh/@huggingface/transformers@3.3.3',
-  'https://unpkg.com/@huggingface/transformers@3.3.3',
+/**
+ * 依次尝试的 transformers.js 加载地址（第一个成功即用）。
+ * wasmPaths 必须与各自的 CDN 目录结构匹配——不能用正则从 transformers 的地址推导，
+ * 因为 esm.sh / unpkg 的路径规则与 jsDelivr 完全不同。
+ */
+interface EngineSource {
+  url: string;
+  wasmPaths: string;
+  label: string;
+}
+
+const TRANSFORMERS_SOURCES: EngineSource[] = [
+  {
+    // 国内可直连、路径规则的 npm CDN
+    url: 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3',
+    wasmPaths: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/',
+    label: 'jsDelivr',
+  },
+  {
+    url: 'https://esm.sh/@huggingface/transformers@3.3.3',
+    wasmPaths: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/',
+    label: 'esm.sh',
+  },
+  {
+    url: 'https://unpkg.com/@huggingface/transformers@3.3.3',
+    wasmPaths: 'https://unpkg.com/onnxruntime-web@1.20.1/dist/',
+    label: 'unpkg',
+  },
 ];
 
 let transformersModule: any = null;
 
-async function loadTransformers(): Promise<any> {
-  if (transformersModule) return transformersModule;
-
-  const errors: string[] = [];
-  for (const url of TRANSFORMERS_SOURCES) {
-    try {
-      post({ type: 'status', message: `正在加载语音识别引擎…` });
-      const mod = await import(/* @vite-ignore */ url);
-      // 把 onnxruntime 的 wasm 文件也指向同一个 CDN，避免相对路径 404
-      try {
-        mod.env.backends.onnx.wasm.wasmPaths = url.replace(/\/@huggingface\/transformers@[\d.]+$/, '/onnxruntime-web@1.20.1/dist/');
-      } catch {
-        /* 忽略：不同版本字段可能不同 */
-      }
-      mod.env.allowLocalModels = false;
-      transformersModule = mod;
-      return mod;
-    } catch (err) {
-      errors.push(`${url} → ${err instanceof Error ? err.message : String(err)}`);
-    }
+function applyEnv(mod: any, source: EngineSource) {
+  try {
+    mod.env.allowLocalModels = false;
+    mod.env.useBrowserCache = true;
+    mod.env.backends.onnx.wasm.wasmPaths = source.wasmPaths;
+    // 静态站点无法设置 COOP/COEP 响应头，多线程 WASM 会失败；固定单线程最稳
+    mod.env.backends.onnx.wasm.numThreads = 1;
+    mod.env.backends.onnx.wasm.proxy = false;
+  } catch {
+    /* 忽略：不同版本的字段可能不同 */
   }
-  throw new Error(
-    `无法加载语音识别引擎（transformers.js）。请检查网络后刷新页面重试。\n尝试过的地址：\n  ${errors.join('\n  ')}`,
-  );
+}
+
+/** 按指定源加载引擎（同一个源只加载一次，结果缓存复用）。 */
+async function loadTransformers(source: EngineSource): Promise<any> {
+  if (transformersModule) return transformersModule;
+  post({ type: 'status', message: `正在加载语音识别引擎（${source.label}）…` });
+  const mod = await import(/* @vite-ignore */ source.url);
+  applyEnv(mod, source);
+  transformersModule = mod;
+  return mod;
 }
 
 async function getPipeline(
@@ -69,9 +87,7 @@ async function getPipeline(
     return cached;
   }
 
-  const mod = await loadTransformers();
-  const { pipeline } = mod;
-
+  // auto：有 WebGPU 就先试 WebGPU，失败回退 CPU
   const attempts: Array<{ device: string; dtype: string; label: string }> = [];
   if (device === 'webgpu') {
     attempts.push({ device: 'webgpu', dtype, label: `WebGPU(${dtype})` });
@@ -79,36 +95,49 @@ async function getPipeline(
   } else if (device === 'wasm') {
     attempts.push({ device: 'wasm', dtype, label: `WASM(${dtype})` });
   } else {
-    // auto：有 WebGPU 就先试 WebGPU，失败回退 CPU
     const hasWebGPU = typeof (navigator as unknown as { gpu?: unknown }).gpu !== 'undefined';
     if (hasWebGPU) attempts.push({ device: 'webgpu', dtype, label: `WebGPU(${dtype})` });
     attempts.push({ device: 'wasm', dtype: 'q8', label: 'WASM(q8)' });
   }
 
   const errors: string[] = [];
-  for (const attempt of attempts) {
+  // 外层遍历引擎源：某个 CDN 挂了/被墙时换下一个；内层遍历后端（WebGPU → WASM）
+  for (const source of TRANSFORMERS_SOURCES) {
+    let mod: any;
     try {
-      post({ type: 'status', message: `正在准备模型 ${model} · ${attempt.label}（首次使用需下载，请稍候）` });
-      const pipe = await pipeline('automatic-speech-recognition', model, {
-        device: attempt.device,
-        dtype: attempt.dtype,
-        progress_callback: (p: any) => {
-          if (aborted) return;
-          if (p && typeof p.progress === 'number') {
-            const pct = Math.max(0, Math.min(1, p.progress / 100));
-            post({
-              type: 'progress',
-              stage: 'load',
-              value: pct,
-              note: p.file ? `${p.status ?? ''} ${String(p.file).split('/').pop()}`.trim() : p.status,
-            });
-          }
-        },
-      });
-      pipelineCache.set(key, pipe);
-      return pipe;
+      mod = await loadTransformers(source);
     } catch (err) {
-      errors.push(`${attempt.label}: ${err instanceof Error ? err.message : String(err)}`);
+      errors.push(`引擎(${source.label}): ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+
+    for (const attempt of attempts) {
+      try {
+        post({
+          type: 'status',
+          message: `正在准备模型 ${model} · ${attempt.label} · ${source.label}（首次使用需下载，请稍候）`,
+        });
+        const pipe = await mod.pipeline('automatic-speech-recognition', model, {
+          device: attempt.device,
+          dtype: attempt.dtype,
+          progress_callback: (p: any) => {
+            if (aborted) return;
+            if (p && typeof p.progress === 'number') {
+              const pct = Math.max(0, Math.min(1, p.progress / 100));
+              post({
+                type: 'progress',
+                stage: 'load',
+                value: pct,
+                note: p.file ? `${p.status ?? ''} ${String(p.file).split('/').pop()}`.trim() : p.status,
+              });
+            }
+          },
+        });
+        pipelineCache.set(key, pipe);
+        return pipe;
+      } catch (err) {
+        errors.push(`${source.label}/${attempt.label}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 
@@ -228,15 +257,20 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
       note: `${cursor.toFixed(0)}s / ${totalSeconds.toFixed(0)}s`,
     });
 
+    // 计算下一个切片起点。无论走哪条分支，都必须严格前进，否则会死循环。
+    const minStep = Math.max(0.5, Math.min(strideSeconds, chunkSeconds * 0.9));
+    let next: number;
     if (advanced) {
-      // 从最后一条字幕的结束时间继续，保证重叠、不丢词
-      const next = Math.max(lastEnd - 0.2, cursor + strideSeconds);
-      cursor = next;
+      // 从最后一条字幕的结束时间继续：保留重叠、不丢词
+      next = Math.max(lastEnd - 0.2, cursor + minStep);
     } else {
       // 本片没有可用时间戳：按固定步长推进
-      cursor = end - strideSeconds;
-      if (cursor <= 0) cursor = end;
+      next = end - strideSeconds;
     }
+    if (!(next > cursor)) next = cursor + minStep;
+    // 距离末尾不足一个最小步长时直接收尾，避免最后反复扫同一小段
+    if (totalSeconds - next < Math.min(minStep, 1)) break;
+    cursor = next;
   }
 
   post({ type: 'result', segments: raw, language, duration: totalSeconds });
