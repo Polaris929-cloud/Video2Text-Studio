@@ -1,0 +1,72 @@
+/* 启动阶段的样式：必须内联/独立加载，不能依赖打包产物，否则主 JS 失败时样式也没了 */
+
+.boot-loading,
+.boot-fallback {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', Roboto, Arial, sans-serif;
+  color: #e8ecf8;
+  max-width: 760px;
+  margin: 12vh auto 0;
+  padding: 0 24px;
+  line-height: 1.7;
+}
+
+.boot-loading {
+  text-align: center;
+  color: #97a3c4;
+}
+
+.boot-loading .boot-spinner {
+  width: 34px;
+  height: 34px;
+  margin: 0 auto 18px;
+  border: 3px solid #26325c;
+  border-top-color: #4f7cff;
+  border-radius: 50%;
+  animation: boot-spin 0.9s linear infinite;
+}
+
+@keyframes boot-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.boot-fallback h1 {
+  font-size: 20px;
+  margin: 0 0 12px;
+  color: #ffd7d7;
+}
+
+.boot-fallback .boot-msg {
+  margin: 0 0 14px;
+  color: #dfe6ff;
+  word-break: break-word;
+}
+
+.boot-fallback .boot-detail {
+  background: #0e1530;
+  border: 1px solid #26325c;
+  border-radius: 10px;
+  padding: 12px 14px;
+  color: #ffd7d7;
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 260px;
+  overflow: auto;
+  margin: 0 0 14px;
+}
+
+.boot-fallback .boot-hint {
+  color: #97a3c4;
+  font-size: 13px;
+}
+
+.boot-fallback kbd {
+  background: #1b2547;
+  border: 1px solid #35487f;
+  border-radius: 5px;
+  padding: 1px 6px;
+  font-size: 12px;
+  font-family: inherit;
+}

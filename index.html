@@ -10,9 +10,17 @@
       content="纯浏览器本地的视频字幕提取工具：导入视频，用 Whisper 在本机完成语音识别，自动生成字幕与内容总结，可导出 TXT / SRT / VTT / Markdown。视频不上传任何服务器。"
     />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%234f7cff'/%3E%3Cpath d='M30 26h40v12H44v10h22v12H44v10h26v12H30z' fill='white'/%3E%3C/svg%3E" />
+    <!-- 启动守卫：主 JS 加载失败/运行时报错时，把错误显示在页面上而不是白屏 -->
+    <link rel="stylesheet" href="./boot.css" />
+    <script src="./boot.js" defer></script>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div class="boot-loading">
+        <div class="boot-spinner"></div>
+        <p>正在加载 Video2Text Studio…</p>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
