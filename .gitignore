@@ -1,0 +1,30 @@
+# 依赖与构建产物
+node_modules/
+dist/
+dist-ssr/
+
+# 日志
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# 编辑器 / 系统
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# 本地环境
+.env
+.env.local
+.env.*.local
+
+# 临时文件
+*.local
+.cache/
+.temp/
+.npm-cache/
