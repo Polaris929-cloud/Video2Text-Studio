@@ -75,6 +75,15 @@ async function loadTransformers(source: EngineSource): Promise<any> {
   return mod;
 }
 
+/** 去重并保持顺序 */
+function dedupe(list: string[]): string[] {
+  const out: string[] = [];
+  for (const item of list) {
+    if (item && !out.includes(item)) out.push(item);
+  }
+  return out;
+}
+
 async function getPipeline(
   model: string,
   device: string,
@@ -87,21 +96,31 @@ async function getPipeline(
     return cached;
   }
 
-  // auto：有 WebGPU 就先试 WebGPU，失败回退 CPU
+  /*
+   * 回退链：外层 CDN 源 × 内层（设备 + 精度）。
+   * 精度回退很关键——某些模型的仓库里并没有 q8 量化权重，
+   * 只有 fp16/fp32；写死一个精度会让用户直接卡在"加载失败"。
+   */
+  const devices: string[] = [];
+  if (device === 'webgpu') devices.push('webgpu', 'wasm');
+  else if (device === 'wasm') devices.push('wasm');
+  else devices.push(...(typeof (navigator as unknown as { gpu?: unknown }).gpu !== 'undefined' ? ['webgpu', 'wasm'] : ['wasm']));
+
   const attempts: Array<{ device: string; dtype: string; label: string }> = [];
-  if (device === 'webgpu') {
-    attempts.push({ device: 'webgpu', dtype, label: `WebGPU(${dtype})` });
-    attempts.push({ device: 'wasm', dtype: 'q8', label: 'WASM(q8)' });
-  } else if (device === 'wasm') {
-    attempts.push({ device: 'wasm', dtype, label: `WASM(${dtype})` });
-  } else {
-    const hasWebGPU = typeof (navigator as unknown as { gpu?: unknown }).gpu !== 'undefined';
-    if (hasWebGPU) attempts.push({ device: 'webgpu', dtype, label: `WebGPU(${dtype})` });
-    attempts.push({ device: 'wasm', dtype: 'q8', label: 'WASM(q8)' });
+  const seen = new Set<string>();
+  for (const dev of devices) {
+    // 用户选的精度优先，其余按"体积从小到大"依次兜底
+    const order = dedupe([dtype, ...(dev === 'wasm' ? ['q8', 'q4', 'fp32'] : ['q8', 'fp16', 'q4', 'fp32'])]);
+    for (const dt of order) {
+      const key = `${dev}|${dt}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      attempts.push({ device: dev, dtype: dt, label: `${dev === 'wasm' ? 'CPU' : 'WebGPU'}·${dt}` });
+    }
   }
 
   const errors: string[] = [];
-  // 外层遍历引擎源：某个 CDN 挂了/被墙时换下一个；内层遍历后端（WebGPU → WASM）
+  // 外层遍历引擎源：某个 CDN 挂了/被墙时换下一个；内层遍历后端与精度
   for (const source of TRANSFORMERS_SOURCES) {
     let mod: any;
     try {
@@ -206,6 +225,8 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
     stride_length_s: 5,
   };
   if (language && language !== 'auto') {
+    // 显式指定语言可跳过模型的语言探测，更快也更准。
+    // 'auto' 时这里什么都不传——transformers.js 会自动检测语言。
     callOptions.language = language;
     callOptions.task = 'transcribe';
   }

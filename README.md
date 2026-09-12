@@ -17,7 +17,7 @@
 | 🎥 视频导入 | 拖拽或选择本地视频/音频文件，支持 MP4 / MOV / WebM / MP3 / M4A / WAV 等浏览器可解码的格式 |
 | 🗣️ 语音识别 | 基于 **Whisper**（transformers.js + ONNX Runtime Web），在浏览器内本地推理，**无需 API Key** |
 | 🌍 多语言 | 中文、英文、日语、韩语、粤语等 15 种语言，可自动检测 |
-| ⚡ 硬件加速 | 自动优先使用 **WebGPU**，不支持时回退到 WASM（CPU） |
+| ⚡ 硬件加速 | 自动优先使用 **WebGPU**，不支持时回退 WASM（CPU）；所选精度缺失时会自动换用其它精度，不会卡住 |
 | 📝 字幕文稿 | 带时间戳的字幕列表，点击任意一条可跳转到视频对应位置播放，支持搜索 |
 | 🧠 内容总结 | 默认**本地抽取式摘要**（TextRank/MMR + 关键词，免配置）；也可接入任意 OpenAI 兼容接口获得 AI 生成式摘要 |
 | 📄 导出文档 | 一键导出 **Markdown 文本文档**、纯文本 TXT、字幕 SRT / VTT、结构化 JSON |
@@ -52,6 +52,23 @@ npm test             # 运行纯算法自测（导出格式 / 摘要算法）
 ```
 
 `dist/` 是纯静态文件，可以丢到任意静态托管（GitHub Pages / Vercel / Netlify / Nginx）。
+
+如果 `vite preview` 在你的机器上不可用，仓库还带了一个零依赖的静态服务器：
+
+```bash
+node scripts/serve.mjs 4173 dist   # 然后打开 http://127.0.0.1:4173/
+```
+
+### 方式三：发布 / 更新自己的仓库
+
+```bash
+node scripts/github-deploy.mjs <owner>/<repo>   # 通过 GitHub API 建仓并推送（需要 gh 已登录）
+node scripts/verify-pages.mjs  <owner>/<repo>   # 轮询 Actions 与 Pages 构建结果
+```
+
+> 之所以提供这两个脚本：本机 hosts 把 `github.com` 指向了 127.0.0.1，`git`/`curl` 直连不可用，
+> 只有 `gh` 的 API 通道能出去，所以用 Git Data API 完成了首次推送。
+> 配好 `gh auth setup-git` 之后，日常更新直接用 `git push` 即可。
 
 ---
 
