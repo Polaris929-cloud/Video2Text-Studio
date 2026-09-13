@@ -127,6 +127,8 @@ export class WhisperClient {
         device: settings.device,
         chunkSeconds: settings.chunkSeconds,
         strideSeconds: settings.strideSeconds,
+        engineSource: settings.engineSource,
+        modelHost: settings.modelHost,
       };
       // 用 transferable 传大数组，避免拷贝
       worker.postMessage(payload, [audio.buffer]);

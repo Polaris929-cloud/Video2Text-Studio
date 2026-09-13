@@ -53,6 +53,10 @@ export type WorkerInMessage =
       chunkSeconds: number;
       /** 分片重叠时长（秒），用于避免边界丢词 */
       strideSeconds: number;
+      /** 引擎 CDN 源 */
+      engineSource: string;
+      /** 模型下载源（镜像） */
+      modelHost: string;
     }
   | { type: 'abort' };
 
@@ -74,6 +78,10 @@ export interface AsrSettings {
   language: string;
   device: 'auto' | 'wasm' | 'webgpu';
   dtype: string;
+  /** 引擎 CDN 源：auto / jsdelivr / unpkg / esmsh */
+  engineSource: string;
+  /** 模型下载源（镜像），空字符串表示官方 huggingface.co */
+  modelHost: string;
   chunkSeconds: number;
   strideSeconds: number;
 }

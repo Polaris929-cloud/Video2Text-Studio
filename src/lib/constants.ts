@@ -39,9 +39,25 @@ export const DEFAULT_ASR: AsrSettings = {
   language: 'auto',
   device: 'auto',
   dtype: 'q8',
+  engineSource: 'auto',
+  modelHost: '',
   chunkSeconds: 30,
   strideSeconds: 5,
 };
+
+/** 模型下载源候选（国内访问 huggingface.co 不通时的镜像） */
+export const MODEL_HOSTS: Array<{ value: string; label: string }> = [
+  { value: '', label: '官方 huggingface.co' },
+  { value: 'https://hf-mirror.com/', label: '国内镜像 hf-mirror.com' },
+];
+
+/** 引擎 CDN 候选 */
+export const ENGINE_SOURCE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: 'auto', label: '自动（jsDelivr，最稳）' },
+  { value: 'jsdelivr', label: 'jsDelivr' },
+  { value: 'unpkg', label: 'unpkg' },
+  { value: 'esmsh', label: 'esm.sh' },
+];
 
 export const DEFAULT_LLM: LlmSettings = {
   enabled: false,

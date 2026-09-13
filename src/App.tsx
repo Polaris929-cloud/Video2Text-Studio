@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { extractAudio } from './lib/audio';
-import { DEFAULT_ASR, DEFAULT_LLM, LANGUAGES, LLM_PRESETS, MODELS } from './lib/constants';
+import { DEFAULT_ASR, DEFAULT_LLM, ENGINE_SOURCE_OPTIONS, LANGUAGES, LLM_PRESETS, MODELS, MODEL_HOSTS } from './lib/constants';
 import { buildExport, downloadText, formatClock, safeBaseName, type ExportFormat } from './lib/format';
 import { summarizeLocal } from './lib/summarize';
 import { summarizeWithLlm, testLlmConnection } from './lib/llm';
@@ -388,6 +388,28 @@ export default function App() {
                 onChange={(e) => setAsr({ ...asr, strideSeconds: Math.max(0, Math.min(10, Number(e.target.value) || 0)) })}
               />
               <small>重叠可减少切片边界丢词</small>
+            </label>
+            <label>
+              <span>模型下载源</span>
+              <select value={asr.modelHost} onChange={(e) => setAsr({ ...asr, modelHost: e.target.value })}>
+                {MODEL_HOSTS.map((h) => (
+                  <option key={h.value || 'official'} value={h.value}>
+                    {h.label}
+                  </option>
+                ))}
+              </select>
+              <small>若模型一直停在 0%（下载不动），多半是连不上 huggingface.co，请换镜像</small>
+            </label>
+            <label>
+              <span>引擎 CDN 源</span>
+              <select value={asr.engineSource} onChange={(e) => setAsr({ ...asr, engineSource: e.target.value })}>
+                {ENGINE_SOURCE_OPTIONS.map((s) => (
+                  <option key={s.value} value={s.value}>
+                    {s.label}
+                  </option>
+                ))}
+              </select>
+              <small>加载不出来时换一个 CDN 试试</small>
             </label>
           </div>
           <div className="panel-footer">

@@ -21,56 +21,60 @@ let aborted = false;
 const pipelineCache = new Map<string, AnyFn>();
 
 /**
- * 依次尝试的 transformers.js 加载地址（第一个成功即用）。
- * wasmPaths 必须与各自的 CDN 目录结构匹配——不能用正则从 transformers 的地址推导，
- * 因为 esm.sh / unpkg 的路径规则与 jsDelivr 完全不同。
+ * 可选的 transformers.js 加载源（第一个成功即用）。
+ *
+ * 重要：不要覆盖 env.backends.onnx.wasm.wasmPaths！
+ * transformers.js 的 dist 目录里**自带** onnxruntime 的 wasm 文件，默认指向
+ *   https://cdn.jsdelivr.net/npm/@huggingface/transformers@<version>/dist/
+ * 一旦手动指到别的 onnxruntime 版本，就极容易因为版本号/文件名不匹配而 404，
+ * 表现为"模型一直卡在 0%"（本项目就踩过：曾错指向 onnxruntime-web@1.20.1，该版本没有 .jsep.wasm）。
  */
 interface EngineSource {
   url: string;
-  wasmPaths: string;
   label: string;
 }
 
-const TRANSFORMERS_SOURCES: EngineSource[] = [
-  {
-    // 国内可直连、路径规则的 npm CDN
-    url: 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3',
-    wasmPaths: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/',
-    label: 'jsDelivr',
-  },
-  {
-    url: 'https://esm.sh/@huggingface/transformers@3.3.3',
-    wasmPaths: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/',
-    label: 'esm.sh',
-  },
-  {
-    url: 'https://unpkg.com/@huggingface/transformers@3.3.3',
-    wasmPaths: 'https://unpkg.com/onnxruntime-web@1.20.1/dist/',
-    label: 'unpkg',
-  },
-];
+const ENGINE_SOURCES: Record<string, EngineSource> = {
+  auto: { url: 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3', label: 'jsDelivr' },
+  jsdelivr: { url: 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3', label: 'jsDelivr' },
+  unpkg: { url: 'https://unpkg.com/@huggingface/transformers@3.3.3', label: 'unpkg' },
+  esmsh: { url: 'https://esm.sh/@huggingface/transformers@3.3.3', label: 'esm.sh' },
+};
 
 let transformersModule: any = null;
 
-function applyEnv(mod: any, source: EngineSource) {
+/** 按引擎源设置 + 模型下载源（镜像）配置环境 */
+function applyEnv(mod: any, modelHost: string) {
   try {
     mod.env.allowLocalModels = false;
     mod.env.useBrowserCache = true;
-    mod.env.backends.onnx.wasm.wasmPaths = source.wasmPaths;
+  } catch {
+    /* 忽略 */
+  }
+  try {
+    if (modelHost) {
+      // 自定义镜像（例如国内常用的 https://hf-mirror.com/），必须以 / 结尾
+      mod.env.remoteHost = modelHost.endsWith('/') ? modelHost : `${modelHost}/`;
+    }
+  } catch {
+    /* 忽略 */
+  }
+  try {
     // 静态站点无法设置 COOP/COEP 响应头，多线程 WASM 会失败；固定单线程最稳
     mod.env.backends.onnx.wasm.numThreads = 1;
     mod.env.backends.onnx.wasm.proxy = false;
   } catch {
     /* 忽略：不同版本的字段可能不同 */
   }
+  // 注意：这里刻意不设置 wasmPaths，使用 transformers.js 自带的默认值
 }
 
 /** 按指定源加载引擎（同一个源只加载一次，结果缓存复用）。 */
-async function loadTransformers(source: EngineSource): Promise<any> {
+async function loadTransformers(source: EngineSource, modelHost: string): Promise<any> {
   if (transformersModule) return transformersModule;
   post({ type: 'status', message: `正在加载语音识别引擎（${source.label}）…` });
   const mod = await import(/* @vite-ignore */ source.url);
-  applyEnv(mod, source);
+  applyEnv(mod, modelHost);
   transformersModule = mod;
   return mod;
 }
@@ -84,10 +88,44 @@ function dedupe(list: string[]): string[] {
   return out;
 }
 
+/** 字节数格式化，用于显示模型下载进度 */
+function fmtMB(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(2)}GB`;
+  return `${Math.round(bytes / 1024 / 1024)}MB`;
+}
+
+/** 下载停滞检测：超过 STALL_TIMEOUT 没有进度事件就报错，而不是无限等待 */
+const STALL_TIMEOUT = 90_000;
+let lastTick = Date.now();
+let stallTimer: ReturnType<typeof setInterval> | null = null;
+
+function tick() {
+  lastTick = Date.now();
+}
+
+function withStallGuard(promise: Promise<any>, label: string): Promise<AnyFn> {
+  tick();
+  if (!stallTimer) {
+    stallTimer = setInterval(() => {
+      if (aborted) return;
+      const idle = Date.now() - lastTick;
+      if (idle > STALL_TIMEOUT) {
+        post({
+          type: 'status',
+          message: `${label} 已停滞 ${Math.round(idle / 1000)} 秒没有下载进度，可能被网络拦截。若一直不动，请点「中止」并改用镜像源或更小的模型。`,
+        });
+      }
+    }, 10_000);
+  }
+  return promise as Promise<AnyFn>;
+}
+
 async function getPipeline(
   model: string,
   device: string,
   dtype: string,
+  engineSource: string,
+  modelHost: string,
 ): Promise<AnyFn> {
   const key = `${model}|${device}|${dtype}`;
   const cached = pipelineCache.get(key);
@@ -97,9 +135,9 @@ async function getPipeline(
   }
 
   /*
-   * 回退链：外层 CDN 源 × 内层（设备 + 精度）。
-   * 精度回退很关键——某些模型的仓库里并没有 q8 量化权重，
-   * 只有 fp16/fp32；写死一个精度会让用户直接卡在"加载失败"。
+   * 回退链：设备（WebGPU → CPU）× 精度。
+   * 精度只回退一跳（所选精度 → fp32），不做全精度轮询——
+   * 否则一个精度失败就会去下 1GB 的 fp32，用户会以为"卡死"。
    */
   const devices: string[] = [];
   if (device === 'webgpu') devices.push('webgpu', 'wasm');
@@ -107,24 +145,24 @@ async function getPipeline(
   else devices.push(...(typeof (navigator as unknown as { gpu?: unknown }).gpu !== 'undefined' ? ['webgpu', 'wasm'] : ['wasm']));
 
   const attempts: Array<{ device: string; dtype: string; label: string }> = [];
-  const seen = new Set<string>();
   for (const dev of devices) {
-    // 用户选的精度优先，其余按"体积从小到大"依次兜底
-    const order = dedupe([dtype, ...(dev === 'wasm' ? ['q8', 'q4', 'fp32'] : ['q8', 'fp16', 'q4', 'fp32'])]);
+    const order = dedupe([dtype, 'fp32']);
     for (const dt of order) {
-      const key = `${dev}|${dt}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
       attempts.push({ device: dev, dtype: dt, label: `${dev === 'wasm' ? 'CPU' : 'WebGPU'}·${dt}` });
     }
   }
 
+  const sources: EngineSource[] = [
+    ENGINE_SOURCES[engineSource] ?? ENGINE_SOURCES.auto,
+    ...Object.values(ENGINE_SOURCES).filter((s) => s.label !== (ENGINE_SOURCES[engineSource] ?? ENGINE_SOURCES.auto).label),
+  ];
+
   const errors: string[] = [];
   // 外层遍历引擎源：某个 CDN 挂了/被墙时换下一个；内层遍历后端与精度
-  for (const source of TRANSFORMERS_SOURCES) {
+  for (const source of sources) {
     let mod: any;
     try {
-      mod = await loadTransformers(source);
+      mod = await loadTransformers(source, modelHost);
     } catch (err) {
       errors.push(`引擎(${source.label}): ${err instanceof Error ? err.message : String(err)}`);
       continue;
@@ -136,33 +174,44 @@ async function getPipeline(
           type: 'status',
           message: `正在准备模型 ${model} · ${attempt.label} · ${source.label}（首次使用需下载，请稍候）`,
         });
-        const pipe = await mod.pipeline('automatic-speech-recognition', model, {
-          device: attempt.device,
-          dtype: attempt.dtype,
-          progress_callback: (p: any) => {
-            if (aborted) return;
-            if (p && typeof p.progress === 'number') {
-              const pct = Math.max(0, Math.min(1, p.progress / 100));
-              post({
-                type: 'progress',
-                stage: 'load',
-                value: pct,
-                note: p.file ? `${p.status ?? ''} ${String(p.file).split('/').pop()}`.trim() : p.status,
-              });
-            }
-          },
-        });
+        const pipe = await withStallGuard(
+          mod.pipeline('automatic-speech-recognition', model, {
+            device: attempt.device,
+            dtype: attempt.dtype,
+            progress_callback: (p: any) => {
+              if (aborted) return;
+              tick();
+              if (p && typeof p.progress === 'number') {
+                const pct = Math.max(0, Math.min(1, p.progress / 100));
+                const loaded = typeof p.loaded === 'number' ? p.loaded : null;
+                const total = typeof p.total === 'number' ? p.total : null;
+                const sizeText = loaded && total ? ` ${fmtMB(loaded)}/${fmtMB(total)}` : '';
+                post({
+                  type: 'progress',
+                  stage: 'load',
+                  value: pct,
+                  note: p.file ? `${String(p.file).split('/').pop()} ${Math.round(pct * 100)}%${sizeText}` : p.status,
+                });
+              }
+            },
+          }),
+          `${attempt.label} · ${source.label}`,
+        );
         pipelineCache.set(key, pipe);
         return pipe;
       } catch (err) {
         errors.push(`${source.label}/${attempt.label}: ${err instanceof Error ? err.message : String(err)}`);
+        if (aborted) return Promise.reject(new Error('已取消'));
       }
     }
   }
 
   throw new Error(
     `模型 ${model} 加载失败。\n${errors.join('\n')}\n` +
-      `可能原因：网络无法访问 huggingface.co / CDN；或模型名拼写有误；或设备不支持所选后端（可在设置里切换为 WASM）。`,
+      `可能原因：\n` +
+      `  1. 网络访问不到模型源（默认 huggingface.co）—— 可在「识别设置」里把「模型下载源」改成镜像站，例如 https://hf-mirror.com/；\n` +
+      `  2. 该模型仓库里没有所选精度（q8/fp16）的权重，请改用 fp32 或换一个小模型；\n` +
+      `  3. 引擎 CDN 被拦截 —— 可在设置里切换引擎源。`,
   );
 }
 
@@ -213,10 +262,10 @@ function overlapDedup(prev: string, next: string): string {
 }
 
 async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>) {
-  const { audio, model, language, dtype, device, chunkSeconds, strideSeconds } = msg;
+  const { audio, model, language, dtype, device, chunkSeconds, strideSeconds, engineSource, modelHost } = msg;
   const totalSeconds = audio.length / 16000;
 
-  const pipe = await getPipeline(model, device, dtype);
+  const pipe = await getPipeline(model, device, dtype, engineSource, modelHost);
   if (aborted) return;
 
   const callOptions: Record<string, unknown> = {
@@ -301,6 +350,10 @@ self.onmessage = async (event: MessageEvent<WorkerInMessage>) => {
   const msg = event.data;
   if (msg.type === 'abort') {
     aborted = true;
+    if (stallTimer) {
+      clearInterval(stallTimer);
+      stallTimer = null;
+    }
     return;
   }
   if (msg.type === 'transcribe') {
@@ -314,6 +367,11 @@ self.onmessage = async (event: MessageEvent<WorkerInMessage>) => {
         type: 'error',
         message: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      if (stallTimer) {
+        clearInterval(stallTimer);
+        stallTimer = null;
+      }
     }
   }
 };
