@@ -52,8 +52,29 @@ function cleanup() {
 /**
  * 调用 gh api，返回解析后的 JSON。
  * 走 cmd.exe 重定向到文件，避免管道 stdio 被沙箱拒绝。
+ *
+ * 本机 GitHub 流量经过一个本地代理，偶发 502/超时，因此这里对
+ * 5xx 与网络类错误做自动重试（对 4xx 不重试，那些是真实的业务错误）。
  */
 async function ghApi(endpoint, { method = 'GET', body, allowStatus = [], jq } = {}) {
+  const MAX_ATTEMPTS = 4;
+  let lastResult = null;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const result = await ghApiOnce(endpoint, { method, body, allowStatus, jq });
+    lastResult = result;
+
+    const retriable = result.status >= 500 || result.status === 0 || result.status === 429;
+    if (!retriable || attempt === MAX_ATTEMPTS) return result;
+
+    const wait = 1000 * attempt;
+    console.log(`  ⟳ ${method} ${endpoint} 返回 ${result.status}，${wait}ms 后重试（${attempt}/${MAX_ATTEMPTS - 1}）`);
+    await new Promise((r) => setTimeout(r, wait));
+  }
+  return lastResult;
+}
+
+async function ghApiOnce(endpoint, { method = 'GET', body, allowStatus = [], jq } = {}) {
   const parts = [`"${GH}"`, 'api', `"${endpoint}"`];
   if (method !== 'GET') parts.push('--method', method);
   if (body !== undefined) {

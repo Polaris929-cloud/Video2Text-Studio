@@ -41,6 +41,7 @@ export const DEFAULT_ASR: AsrSettings = {
   dtype: 'q8',
   engineSource: 'auto',
   modelHost: '',
+  localModel: false,
   chunkSeconds: 30,
   strideSeconds: 5,
 };

@@ -411,7 +411,34 @@ export default function App() {
               </select>
               <small>加载不出来时换一个 CDN 试试</small>
             </label>
+            <label>
+              <span>本地模型目录（离线用）</span>
+              <input
+                value={asr.localModel ? asr.model : ''}
+                disabled={!asr.localModel}
+                placeholder="例如：D:/models/whisper-base"
+                onChange={(e) => setAsr({ ...asr, model: e.target.value })}
+              />
+              <small>
+                勾选下面的开关后，这里填本地文件夹路径，直接读本地 ONNX 模型，**完全不联网**
+              </small>
+            </label>
           </div>
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={asr.localModel}
+              onChange={(e) => setAsr({ ...asr, localModel: e.target.checked })}
+            />
+            <span>从本地文件夹加载模型（绕过 huggingface.co，适合网络不通的环境）</span>
+          </label>
+          {asr.localModel && (
+            <p className="hint">
+              目录需包含 <code>config.json</code>、<code>tokenizer.json</code>、<code>preprocessor_config.json</code> 以及{' '}
+              <code>onnx/encoder_model_quantized.onnx</code>、<code>onnx/decoder_model_merged_quantized.onnx</code>。
+              若浏览器阻止读取（Edge/Chrome 会询问文件夹权限），请允许访问。
+            </p>
+          )}
           <div className="panel-footer">
             <button className="btn btn-ghost" onClick={() => setAsr(DEFAULT_ASR)}>
               恢复默认

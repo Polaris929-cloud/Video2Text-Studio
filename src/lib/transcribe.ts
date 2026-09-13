@@ -129,6 +129,7 @@ export class WhisperClient {
         strideSeconds: settings.strideSeconds,
         engineSource: settings.engineSource,
         modelHost: settings.modelHost,
+        localModel: settings.localModel,
       };
       // 用 transferable 传大数组，避免拷贝
       worker.postMessage(payload, [audio.buffer]);

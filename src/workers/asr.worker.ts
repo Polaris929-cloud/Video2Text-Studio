@@ -43,16 +43,17 @@ const ENGINE_SOURCES: Record<string, EngineSource> = {
 
 let transformersModule: any = null;
 
-/** 按引擎源设置 + 模型下载源（镜像）配置环境 */
-function applyEnv(mod: any, modelHost: string) {
+/** 按引擎源设置 + 模型来源配置环境 */
+function applyEnv(mod: any, modelHost: string, localModel: boolean) {
   try {
-    mod.env.allowLocalModels = false;
+    // localModel = true 时允许从本地路径读模型（完全不需要联网下载）
+    mod.env.allowLocalModels = localModel;
     mod.env.useBrowserCache = true;
   } catch {
     /* 忽略 */
   }
   try {
-    if (modelHost) {
+    if (!localModel && modelHost) {
       // 自定义镜像（例如国内常用的 https://hf-mirror.com/），必须以 / 结尾
       mod.env.remoteHost = modelHost.endsWith('/') ? modelHost : `${modelHost}/`;
     }
@@ -70,11 +71,11 @@ function applyEnv(mod: any, modelHost: string) {
 }
 
 /** 按指定源加载引擎（同一个源只加载一次，结果缓存复用）。 */
-async function loadTransformers(source: EngineSource, modelHost: string): Promise<any> {
+async function loadTransformers(source: EngineSource, modelHost: string, localModel: boolean): Promise<any> {
   if (transformersModule) return transformersModule;
   post({ type: 'status', message: `正在加载语音识别引擎（${source.label}）…` });
   const mod = await import(/* @vite-ignore */ source.url);
-  applyEnv(mod, modelHost);
+  applyEnv(mod, modelHost, localModel);
   transformersModule = mod;
   return mod;
 }
@@ -126,8 +127,9 @@ async function getPipeline(
   dtype: string,
   engineSource: string,
   modelHost: string,
+  localModel: boolean,
 ): Promise<AnyFn> {
-  const key = `${model}|${device}|${dtype}`;
+  const key = `${model}|${device}|${dtype}|${localModel ? 'local' : modelHost}`;
   const cached = pipelineCache.get(key);
   if (cached) {
     post({ type: 'status', message: '模型已就绪（本地缓存）' });
@@ -162,7 +164,7 @@ async function getPipeline(
   for (const source of sources) {
     let mod: any;
     try {
-      mod = await loadTransformers(source, modelHost);
+      mod = await loadTransformers(source, modelHost, localModel);
     } catch (err) {
       errors.push(`引擎(${source.label}): ${err instanceof Error ? err.message : String(err)}`);
       continue;
@@ -262,10 +264,10 @@ function overlapDedup(prev: string, next: string): string {
 }
 
 async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>) {
-  const { audio, model, language, dtype, device, chunkSeconds, strideSeconds, engineSource, modelHost } = msg;
+  const { audio, model, language, dtype, device, chunkSeconds, strideSeconds, engineSource, modelHost, localModel } = msg;
   const totalSeconds = audio.length / 16000;
 
-  const pipe = await getPipeline(model, device, dtype, engineSource, modelHost);
+  const pipe = await getPipeline(model, device, dtype, engineSource, modelHost, localModel);
   if (aborted) return;
 
   const callOptions: Record<string, unknown> = {

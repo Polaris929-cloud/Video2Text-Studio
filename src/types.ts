@@ -57,6 +57,8 @@ export type WorkerInMessage =
       engineSource: string;
       /** 模型下载源（镜像） */
       modelHost: string;
+      /** 是否从本地文件夹加载模型（完全离线） */
+      localModel: boolean;
     }
   | { type: 'abort' };
 
@@ -82,6 +84,8 @@ export interface AsrSettings {
   engineSource: string;
   /** 模型下载源（镜像），空字符串表示官方 huggingface.co */
   modelHost: string;
+  /** 是否从本地文件夹加载模型（完全离线，不需要下载） */
+  localModel: boolean;
   chunkSeconds: number;
   strideSeconds: number;
 }
