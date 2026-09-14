@@ -29,7 +29,14 @@ export type Stage = 'idle' | 'decoding' | 'loading-model' | 'transcribing' | 'do
 
 /** Worker → 主线程 消息 */
 export type WorkerOutMessage =
-  | { type: 'progress'; stage: 'load' | 'transcribe'; value: number; note?: string }
+  | {
+      type: 'progress';
+      stage: 'load' | 'transcribe';
+      value: number;
+      note?: string;
+      /** 加载阶段细分：探测来源 / 下载中 / 编译初始化（编译阶段没有百分比可言，界面改用动态条） */
+      phase?: 'probe' | 'download' | 'compile';
+    }
   | { type: 'status'; message: string }
   | { type: 'result'; segments: RawSegment[]; language?: string; duration: number }
   | { type: 'error'; message: string };

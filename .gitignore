@@ -32,3 +32,6 @@ Thumbs.db
 .cache/
 .temp/
 .npm-cache/
+
+# Vite 生成的临时配置文件
+vite.config.ts.timestamp-*.mjs

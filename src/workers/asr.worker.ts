@@ -238,12 +238,21 @@ async function probeSource(source: ModelSourceSpec, model: string, dtypes: strin
   }
 
   const available = new Set<string>();
-  await Promise.all(
-    dtypes.map(async (dt) => {
-      const result = await probeOnnx(modelFileUrl(source, model, onnxFileFor(dt)));
-      if (result === 'ok') available.add(dt);
-    }),
-  );
+  /**
+   * 精度探测的取巧之处：**主精度可用就立刻返回，其余精度继续在后台探**。
+   *
+   * 如果这里 await 所有精度（q8 + fp32），一旦某个精度在该来源上不存在
+   * （例如 ModelScope 上没有 fp32 权重），就要白等到 PROBE_TIMEOUT 才继续 ——
+   * 实测每次启动多花 8 秒。`available` 是同一个 Set 引用，后台探完会自行补进去。
+   */
+  const pending = dtypes.map(async (dt) => {
+    const result = await probeOnnx(modelFileUrl(source, model, onnxFileFor(dt)));
+    if (result === 'ok') available.add(dt);
+    return result === 'ok';
+  });
+
+  const primaryOk = await pending[0];
+  if (!primaryOk) await Promise.all(pending); // 主精度不行，才需要等其他精度
 
   if (available.size === 0) {
     return { source, ok: false, reason: '缺少可用的 onnx 权重文件（该模型/精度没有上传）', available, ms: Date.now() - started };
@@ -319,6 +328,29 @@ function fmtMB(bytes: number): string {
   return `${Math.round(bytes / 1024 / 1024)}MB`;
 }
 
+/** 速率显示要保留一位小数，"3.8MB/s" 才有意义 */
+function fmtRate(bytesPerSecond: number): string {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return '';
+  const mb = bytesPerSecond / 1024 / 1024;
+  if (mb >= 1) return `${mb.toFixed(1)}MB/s`;
+  return `${Math.max(1, Math.round(bytesPerSecond / 1024))}KB/s`;
+}
+
+function fmtEta(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '';
+  if (seconds < 60) return `剩余约 ${Math.round(seconds)} 秒`;
+  return `剩余约 ${Math.ceil(seconds / 60)} 分钟`;
+}
+
+/** 把技术文件名换成用户看得懂的说法 */
+function prettyFile(name: string): string {
+  if (/^encoder.*\.onnx$/i.test(name)) return '编码器';
+  if (/^decoder.*\.onnx$/i.test(name)) return '解码器';
+  if (/^tokenizer.*|^vocab\.json$|^merges\.txt$|^added_tokens\.json$/i.test(name)) return '分词器';
+  if (/config\.json$/i.test(name)) return '模型配置';
+  return name;
+}
+
 /** 加载一次模型。任何阶段"没动静"都会主动中止并抛出可读的错误，由上层决定换源还是换精度。 */
 async function attemptPipeline(model: string, source: ModelSourceSpec, device: string, dtype: string): Promise<AnyFn> {
   ensureFetchGuard();
@@ -334,26 +366,65 @@ async function attemptPipeline(model: string, source: ModelSourceSpec, device: s
   let lastEvent = Date.now();
   let stalled: string | null = null;
   let hintPosted = false;
+  let maxOverall = 0;
   const startedAt = Date.now();
 
-  const overall = (): number => {
+  const totals = (): { loaded: number; total: number } => {
     let loaded = 0;
     let total = 0;
-    let pctSum = 0;
     for (const f of files.values()) {
       loaded += f.loaded;
       total += f.total;
-      pctSum += f.pct;
     }
-    const value = total > 0 ? loaded / total : files.size > 0 ? pctSum / files.size : 0;
-    return Math.max(0, Math.min(0.99, value));
+    return { loaded, total };
+  };
+
+  const overall = (): number => {
+    const { loaded, total } = totals();
+    const raw =
+      total > 0
+        ? Math.max(0, Math.min(0.99, loaded / total))
+        : files.size > 0
+          ? Math.max(0, Math.min(0.99, [...files.values()].reduce((s, f) => s + f.pct, 0) / files.size))
+          : 0;
+    // 只增不减：模型是按文件顺序下载的，分母会随着新文件出现而变大，
+    // 直接按比例算会让进度条"倒退"，看起来像出错。这里取历史最大值。
+    if (raw > maxOverall) maxOverall = raw;
+    return maxOverall;
+  };
+
+  /**
+   * 实时下载速率（滑动窗口 8 秒）。
+   * 为什么要做：用户看到"7% 一动不动"就会以为卡死，
+   * 但实际上可能只是慢；把"3.8MB/s · 剩余 12 秒"直接摆出来，才能自己判断。
+   */
+  const samples: Array<{ t: number; loaded: number }> = [];
+  const rate = (): number => {
+    const now = Date.now();
+    samples.push({ t: now, loaded: totals().loaded });
+    while (samples.length > 2 && now - samples[0].t > 8_000) samples.shift();
+    if (samples.length < 2) return 0;
+    const first = samples[0];
+    const last = samples[samples.length - 1];
+    const dt = (last.t - first.t) / 1000;
+    return dt >= 0.5 ? (last.loaded - first.loaded) / dt : 0;
+  };
+
+  /** 进度后缀：已下/总量 · 速度 · 剩余时间 */
+  const rateSuffix = (): string => {
+    const { loaded, total } = totals();
+    if (total <= 0) return '';
+    const speed = rate();
+    const eta = speed > 0 && total > loaded ? (total - loaded) / speed : 0;
+    return ` · ${fmtMB(loaded)}/${fmtMB(total)}${speed > 0 ? ` · ${fmtRate(speed)}` : ''}${eta > 0 ? ` · ${fmtEta(eta)}` : ''}`;
   };
 
   const heartbeat = (): string => {
     const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    const suffix = rateSuffix();
     if (phase === 'compile') return `正在编译 / 初始化推理引擎… 已用 ${elapsed}s`;
     if (phase === 'first') return `正在连接 ${source.label}… 已用 ${elapsed}s`;
-    return `正在下载模型… 已用 ${elapsed}s`;
+    return `正在下载模型… 已用 ${elapsed}s${suffix}`;
   };
 
   const onProgress = (p: any) => {
@@ -367,7 +438,7 @@ async function attemptPipeline(model: string, source: ModelSourceSpec, device: s
     const total = Number(p?.total) || 0;
     const reported = typeof p?.progress === 'number' ? p.progress / 100 : total > 0 ? loaded / total : 0;
     const pct = Math.max(0, Math.min(1, reported));
-    const sizeText = total > 0 ? ` · ${fmtMB(loaded)}/${fmtMB(total)}` : '';
+    const sizeText = rateSuffix();
 
     if (name) {
       const prev = files.get(name);
@@ -391,7 +462,8 @@ async function attemptPipeline(model: string, source: ModelSourceSpec, device: s
       type: 'progress',
       stage: 'load',
       value: overall(),
-      note: name ? `${name} ${Math.round(pct * 100)}%${sizeText}` : String(p?.status ?? '下载中'),
+      phase,
+      note: name ? `${prettyFile(name)} ${Math.round(pct * 100)}%${sizeText}` : String(p?.status ?? '下载中'),
     });
   };
 
@@ -413,7 +485,13 @@ async function attemptPipeline(model: string, source: ModelSourceSpec, device: s
       return;
     }
     // 心跳：让界面每秒都在动，永远不会出现"看起来死掉了"的进度条
-    post({ type: 'progress', stage: 'load', value: overall(), note: `${heartbeat()}` });
+    post({
+      type: 'progress',
+      stage: 'load',
+      value: overall(),
+      phase: phase === 'first' ? 'probe' : phase,
+      note: `${heartbeat()}`,
+    });
     if (!hintPosted && idle > IDLE_HINT) {
       hintPosted = true;
       post({
@@ -488,19 +566,37 @@ async function getPipeline(
   const probeStarted = Date.now();
   for (let i = 0; i < probing.length; i++) {
     const remaining = PROBE_BUDGET - (Date.now() - probeStarted);
-    const result = remaining > 0 ? await Promise.race([probing[i], delay(remaining)]) : null;
+    if (remaining <= 0) break;
+    const result = await Promise.race([probing[i], delay(remaining)]);
     if (result?.ok) {
       ordered.push(result);
-      break; // 找到可用来源就立刻开工，后面的探测结果只用于兜底
+      break; // 找到可用来源就立刻开工
     }
     if (result && !result.ok) failures.set(result.source.id, result.reason);
-    if (remaining <= 0) break;
   }
-  // 其余探测继续在后台完成，作为兜底顺序
-  for (const probe of probing) {
-    const result = await probe;
-    if (result.ok && !ordered.some((r) => r.source.id === result.source.id)) ordered.push(result);
-    else if (!result.ok) failures.set(result.source.id, result.reason);
+
+  if (ordered.length === 0) {
+    // 一个来源都没探到 → 必须收齐所有失败原因，才能给出可读的错误信息
+    const settled = await Promise.all(probing);
+    for (const result of settled) {
+      if (result.ok) ordered.push(result);
+      else failures.set(result.source.id, result.reason);
+    }
+  } else {
+    // 已经能开工了：其余来源只用来决定"兜底顺序"，让它们自己在后台收尾，**绝不 await**。
+    // 之前这里 await 了它们，结果每次启动都被连不通的 huggingface.co 拖到超时才继续，
+    // 白白多等 8 秒（正好是 PROBE_TIMEOUT）。
+    for (const probe of probing) {
+      probe
+        .then((result) => {
+          if (result.ok) {
+            if (!ordered.some((r) => r.source.id === result.source.id)) ordered.push(result);
+          } else {
+            failures.set(result.source.id, result.reason);
+          }
+        })
+        .catch(() => undefined);
+    }
   }
 
   if (aborted) throw new Error('已取消');

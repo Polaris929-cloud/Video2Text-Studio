@@ -23,25 +23,42 @@ export interface ModelSourceSpec {
   label: string;
   /**
    * transformers.js 的 remoteHost，**必须以 / 结尾**。
-   * 配合 remotePathTemplate = '{model}/'，最终地址为 base + model + '/' + 文件名。
+   * 配合 remotePathTemplate，最终地址为 base + 模板替换后的路径 + 文件名。
    */
   base: string;
   kind: ModelSourceKind;
   /** 一句话说明，用于界面提示 */
   note: string;
+  /** 该来源专用的路径模板（缺省用官方模板） */
+  pathTemplate?: string;
 }
 
 /** 站点自带模型目录（相对于站点根，由 deploy 流程把模型文件下载到这里） */
 export const SITE_MODELS_DIR = 'models/';
 
+/** transformers.js 默认的路径模板（Hugging Face Hub 结构） */
+export const REMOTE_PATH_TEMPLATE = '{model}/resolve/{revision}/';
+/** 站点自带模型的目录结构：models/<model-id>/<文件名> */
+export const SITE_PATH_TEMPLATE = '{model}/';
+/** ModelScope 的路径结构：models/<model-id>/resolve/master/<文件名> */
+export const MODELSCOPE_PATH_TEMPLATE = '{model}/resolve/master/';
+
 /** "自动"模式下按顺序尝试的候选源 */
 export const MODEL_SOURCE_CANDIDATES: ModelSourceSpec[] = [
+  {
+    id: 'modelscope',
+    label: '魔搭 ModelScope（国内直连，推荐）',
+    base: 'https://www.modelscope.cn/models/',
+    kind: 'remote',
+    pathTemplate: MODELSCOPE_PATH_TEMPLATE,
+    note: '阿里云域名 + 国内 LFS CDN，浏览器可直接跨域读取，实测比 GitHub Pages / jsDelivr 快一个数量级',
+  },
   {
     id: 'site',
     label: '本站同源',
     base: './models/', // 运行时会被替换成绝对地址
     kind: 'site',
-    note: '模型随站点一起部署，国内可直连，无需任何外网',
+    note: '模型随站点一起部署；国内访问 GitHub Pages 通常较慢，作为兜底',
   },
   {
     id: 'hf',
@@ -55,21 +72,21 @@ export const MODEL_SOURCE_CANDIDATES: ModelSourceSpec[] = [
     label: '镜像 hf-mirror.net',
     base: 'https://hf-mirror.net/',
     kind: 'remote',
-    note: '国内镜像；浏览器可能因 CORS 拦截而失败',
+    note: '浏览器跨域会被它的响应头拦掉（多见于代理/命令行场景）',
   },
   {
     id: 'aifasthub',
     label: '镜像 aifasthub.com',
     base: 'https://aifasthub.com/',
     kind: 'remote',
-    note: '国内镜像；浏览器可能因 CORS 拦截而失败',
+    note: '浏览器跨域会被它的响应头拦掉',
   },
   {
     id: 'hf-mirror.com',
     label: '镜像 hf-mirror.com',
     base: 'https://hf-mirror.com/',
     kind: 'remote',
-    note: '国内镜像；域名本身也经常无法访问',
+    note: '域名本身也经常无法访问',
   },
 ];
 
@@ -161,12 +178,8 @@ export function buildDeviceChain(device: string, hasWebGpu: boolean): string[] {
   return hasWebGpu ? ['webgpu', 'wasm'] : ['wasm'];
 }
 
-/** transformers.js 默认的路径模板（Hugging Face Hub 结构） */
-export const REMOTE_PATH_TEMPLATE = '{model}/resolve/{revision}/';
-/** 站点自带模型的目录结构：models/<model-id>/<文件名> */
-export const SITE_PATH_TEMPLATE = '{model}/';
-
 export function pathTemplateFor(source: ModelSourceSpec): string {
+  if (source.pathTemplate) return source.pathTemplate;
   return source.kind === 'site' ? SITE_PATH_TEMPLATE : REMOTE_PATH_TEMPLATE;
 }
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { extractAudio } from './lib/audio';
-import { DEFAULT_ASR, DEFAULT_LLM, ENGINE_SOURCE_OPTIONS, LANGUAGES, LLM_PRESETS, MODELS, BUILTIN_MODELS } from './lib/constants';
+import { DEFAULT_ASR, DEFAULT_LLM, ENGINE_SOURCE_OPTIONS, LANGUAGES, LLM_PRESETS, MODELS } from './lib/constants';
 import { MODEL_SOURCE_OPTIONS, normalizeHost } from './lib/modelSources';
 import { buildExport, downloadText, formatClock, safeBaseName, type ExportFormat } from './lib/format';
 import { summarizeLocal } from './lib/summarize';
@@ -30,6 +30,13 @@ export default function App() {
   const [file, setFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string>('');
   const [stage, setStage] = useState<Stage>('idle');
+  /**
+   * 加载阶段的细分状态。
+   * 为什么要单独存：模型下载完后还要编译 / 初始化 WASM 推理引擎（本机实测约 30 秒），
+   * 这段时间没有可上报的下载百分比，进度条会一直停着不动 —— 用户就会以为卡死。
+   * 界面据此改成动态条纹 + "编译中…"，明确告诉用户"还在干活"。
+   */
+  const [loadPhase, setLoadPhase] = useState<'probe' | 'download' | 'compile' | 'transcribe'>('download');
   const [progress, setProgress] = useState(0);
   const [note, setNote] = useState('');
   const [error, setError] = useState('');
@@ -150,6 +157,7 @@ export default function App() {
       });
       setAudioDuration(audio.duration);
       setStage('loading-model');
+      setLoadPhase('probe');
       setNote('正在准备语音识别模型…');
 
       if (!clientRef.current) clientRef.current = new WhisperClient();
@@ -159,17 +167,19 @@ export default function App() {
       // 因此下面的展示时长提前从 audio.duration 取好。
       const result = await client.transcribe(audio.samples, asr, {
         onStatus: (message) => setNote(message),
-        onProgress: ({ stage: s, value, note: n }) => {
+        onProgress: ({ stage: s, value, note: n, phase: p }) => {
           // 进度条分三段：解码音轨 0~5%、加载模型 5~15%、语音识别 15~100%。
           // 这样"下载模型"阶段也有可视化进度，不会再出现"0% 一动不动"。
           const ratio = Math.max(0, Math.min(1, value));
           if (s === 'load') {
             setStage('loading-model');
             setProgress(0.05 + ratio * 0.1);
+            setLoadPhase(p ?? 'download');
             setNote(n ? `下载模型：${n}` : '正在准备模型…');
           } else {
             setStage('transcribing');
             setProgress(0.15 + ratio * 0.85);
+            setLoadPhase('transcribe');
             setNote(`语音识别中 ${n ?? `${Math.round(ratio * 100)}%`}`);
           }
         },
@@ -403,9 +413,9 @@ export default function App() {
                 ))}
               </select>
               <small>
-                推荐「自动」：会依次探测各个来源，用能通的那个。<strong>本站同源</strong>
-                模型随站点一起部署，国内无需任何外网，也不受浏览器 CORS 限制
-                （huggingface.co 及其镜像在浏览器里通常会被 CORS 拦住）
+                推荐「自动」：按 <strong>魔搭 ModelScope（国内直连，最快）→ 本站同源 → 官方 → 镜像</strong>{' '}
+                的顺序探测，用第一个能通的。注意 huggingface.co 及其镜像（hf-mirror 等）在浏览器里会被 CORS
+                拦住，命令行能下载不代表浏览器能读
               </small>
             </label>
             {asr.modelSource === 'custom' && (
@@ -435,9 +445,11 @@ export default function App() {
             </label>
           </div>
           <p className="hint">
-            已内置的离线模型：{BUILTIN_MODELS.map((m) => m.split('/').pop()).join(' / ')}（q8 精度）。
-            选这两个模型时，模型文件与站点同源，一次下载后会被浏览器缓存，之后离线也能用。
-            其他模型（Small / Large-v3-Turbo）体积较大未内置，需要能访问 huggingface.co 才能下载。
+            模型默认从<strong>魔搭 ModelScope</strong>（国内直连，实测 8~11MB/s）下载，官方源与本站同源作为兜底；
+            下载过程会显示已下载体积、实时速度和预计剩余时间。
+            下载完成后还要在本机<strong>编译 / 初始化推理引擎</strong>，这一步在 CPU 上首次需要几十秒
+            （界面会显示「初始化推理引擎 · 编译中…」），完成后模型由浏览器缓存，之后再用会快很多。
+            想尽快出结果，建议先选 <strong>Tiny</strong>。
           </p>
           <div className="panel-footer">
             <button className="btn btn-ghost" onClick={() => setAsr(DEFAULT_ASR)}>
@@ -618,11 +630,16 @@ export default function App() {
           {stage !== 'idle' && (
             <div className="card progress-card">
               <div className="progress-head">
-                <span className={`stage stage-${stage}`}>{STAGE_LABEL[stage]}</span>
-                <span className="progress-pct">{progressPercent}%</span>
+                <span className={`stage stage-${stage}`}>
+                  {loadPhase === 'compile' ? '初始化推理引擎' : STAGE_LABEL[stage]}
+                </span>
+                <span className="progress-pct">{loadPhase === 'compile' ? '编译中…' : `${progressPercent}%`}</span>
               </div>
               <div className="bar">
-                <div className="bar-fill" style={{ width: `${Math.max(2, progressPercent)}%` }} />
+                <div
+                  className={`bar-fill${loadPhase === 'compile' ? ' is-indeterminate' : ''}`}
+                  style={{ width: `${Math.max(2, progressPercent)}%` }}
+                />
               </div>
               {note && <p className="hint note">{note}</p>}
             </div>

@@ -8,7 +8,13 @@ import { resolveSiteBase } from './modelSources';
 
 export interface TranscribeCallbacks {
   onStatus?: (message: string) => void;
-  onProgress?: (info: { stage: 'load' | 'transcribe'; value: number; note?: string }) => void;
+  onProgress?: (info: {
+    stage: 'load' | 'transcribe';
+    value: number;
+    note?: string;
+    /** 加载阶段细分，界面据此区分「下载中」与「编译初始化中」 */
+    phase?: 'probe' | 'download' | 'compile';
+  }) => void;
 }
 
 export interface TranscribeResult {
@@ -87,7 +93,7 @@ export class WhisperClient {
             callbacks.onStatus?.(msg.message);
             break;
           case 'progress':
-            callbacks.onProgress?.({ stage: msg.stage, value: msg.value, note: msg.note });
+            callbacks.onProgress?.({ stage: msg.stage, value: msg.value, note: msg.note, phase: msg.phase });
             break;
           case 'result': {
             cleanup();
