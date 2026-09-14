@@ -55,10 +55,12 @@ export type WorkerInMessage =
       strideSeconds: number;
       /** 引擎 CDN 源 */
       engineSource: string;
-      /** 模型下载源（镜像） */
-      modelHost: string;
-      /** 是否从本地文件夹加载模型（完全离线） */
-      localModel: boolean;
+      /** 用户首选的模型来源：auto / site / hf / hf-mirror.net / aifasthub / custom */
+      modelSource: string;
+      /** 自定义模型地址（modelSource === 'custom' 时生效） */
+      customModelHost: string;
+      /** 站点自带模型目录的绝对地址（主线程算好，同源，最可靠） */
+      siteBase: string;
     }
   | { type: 'abort' };
 
@@ -82,10 +84,10 @@ export interface AsrSettings {
   dtype: string;
   /** 引擎 CDN 源：auto / jsdelivr / unpkg / esmsh */
   engineSource: string;
-  /** 模型下载源（镜像），空字符串表示官方 huggingface.co */
-  modelHost: string;
-  /** 是否从本地文件夹加载模型（完全离线，不需要下载） */
-  localModel: boolean;
+  /** 模型来源：auto（自动探测）/ site（本站同源）/ hf / hf-mirror.net / aifasthub / hf-mirror.com / custom */
+  modelSource: string;
+  /** 自定义模型地址（modelSource === 'custom' 时生效） */
+  customModelHost: string;
   chunkSeconds: number;
   strideSeconds: number;
 }

@@ -118,11 +118,14 @@ src/
 └─ lib/
    ├─ audio.ts             音轨提取 + 16 kHz 单声道重采样
    ├─ transcribe.ts        Worker 客户端封装、时间戳归一化
+   ├─ modelSources.ts      模型来源候选链与地址拼装（纯逻辑，可单测）
    ├─ summarize.ts         本地抽取式摘要（TextRank/MMR + 关键词）
    ├─ llm.ts               OpenAI 兼容接口的 AI 摘要
    ├─ format.ts            SRT / VTT / TXT / Markdown / JSON 导出
    ├─ constants.ts         模型与语言清单、默认设置
    └─ storage.ts           localStorage 持久化
+scripts/
+└─ fetch-models.mjs        构建时把内置模型下载到 public/models/
 ```
 
 几个关键设计：
@@ -132,8 +135,31 @@ src/
 - **Whisper 单次窗口是 30 秒**，所以长视频必须切片。这里用的是**带重叠的滑窗**：下一片从「上一片最后一条字幕的结束时间」继续，
   并在拼接时做尾部/头部去重，因此不会在切片边界丢词，也不会整段重复。
 - **识别跑在 Web Worker 里**，界面不会卡死；音频用 `Transferable` 传递，避免大数组拷贝。
-- **模型按需从 CDN 加载**（transformers.js + ONNX Runtime Web 的 wasm），首次下载后由浏览器 `Cache Storage` 缓存。
+- **模型与站点同源部署**：Tiny / Base 两个 q8 模型随站点一起发布（`public/models/`），
+  浏览器直接从本站取，不需要访问任何外部域名。原因见下面「模型加载为什么这么绕」。
 - **构建用相对路径**（`base: './'`），因此产物可以直接部署在 `/Video2Text-Studio/` 这样的子路径下。
+
+### 模型加载为什么这么绕
+
+浏览器端加载模型，踩过两个坑，这也是本项目最容易被"卡住"的地方：
+
+1. **`huggingface.co` 在国内连不上**（TCP 被阻断）。transformers.js 内部的 fetch 默认**没有超时**，
+   于是一个请求都发不出去时，界面会永远停在 0%，看起来就像死机。
+2. **HF 镜像站（hf-mirror 等）能连，但返回的响应头是 `Access-Control-Allow-Origin: https://huggingface.co`**，
+   第三方站点（GitHub Pages）在浏览器里跨域取模型会被 CORS 直接拦截 —— 这是对方响应头的限制，客户端改不了。
+
+所以最终方案是**让模型和站点同一个源**，彻底绕开上面两个问题；并额外做了一层保护：
+
+- `src/lib/modelSources.ts`：模型来源候选链（本站同源 → 官方 → 镜像 → 自定义）与地址拼装；
+- `src/workers/asr.worker.ts`：给模型请求装上**首字节超时 / 停滞超时 / 看门狗**，每秒发一次心跳进度，
+  任何阶段"没动静"都会主动中止并换下一个来源，最终给出**可读的错误**而不是无限等待；
+- `scripts/fetch-models.mjs`：构建时把模型下载到 `public/models/`（CI 里跑，`public/models/` 不入库）；
+- 推理设备默认 `auto`，会**真实请求一次 WebGPU 适配器**再决定用 WebGPU 还是 CPU，
+  避免在拿不到适配器的环境里白等一轮。
+
+另外诊断过的一个隐形坑：**不要手动覆盖 `env.backends.onnx.wasm.wasmPaths`**。
+transformers.js 的 dist 里自带匹配版本的 onnxruntime wasm；一旦指向别的版本（例如 onnxruntime-web@1.20.1），
+会因文件名不匹配（如缺少 `.jsep.wasm`）而 404，表现同样是"卡在 0%"。
 
 ---
 
@@ -154,12 +180,29 @@ src/
 </details>
 
 <details>
-<summary><b>模型下载很慢或失败？</b></summary>
+<summary><b>识别一直停在 0% 不动 / 模型加载失败？</b></summary>
 
-模型默认从 Hugging Face 拉取。如果所在网络访问不畅，可以：
-1. 换小模型（Tiny 约 40 MB）先跑通；
-2. 使用带代理的网络环境后重试；
-3. 克隆本仓库，把 `MODELS`（`src/lib/constants.ts`）里的模型 id 换成你自建/镜像站上的 ONNX 模型，并相应调整 `TRANSFORMERS_SOURCES`（`src/workers/asr.worker.ts`）。
+先看界面上的进度文案：它会明确告诉你**正在连接哪个来源、已经等了多久、以及是否准备换源**，
+不会像以前那样一动不动。然后按提示排查：
+
+1. **用内置模型**：在「识别设置 → 模型」里选 **Tiny** 或 **Base**（这两个是本项目内置、与站点同源的模型），
+   并把「模型来源」保持为 **自动**；
+2. **检查「推理设备」**：拿不到 WebGPU 适配器的环境（无头浏览器、禁用 GPU、老显卡、远程桌面）
+   会在日志里提示，可在「识别设置 → 推理设备」里手动选 **CPU（WASM）**；
+3. **要换别的模型**（Small / Large-v3-Turbo 等）：这些没有内置，需要能连通 Hugging Face 或其镜像，
+   或者自建一个放 ONNX 模型的静态目录，在「识别设置 → 模型来源」里选 **自定义地址** 填进去；
+4. **构建自己的站点**：内置模型由 `npm run fetch:models` 下载到 `public/models/`（不入库），
+   部署工作流 `.github/workflows/deploy-pages.yml` 里已经接好这一步；本地想手动跑也可以直接执行该命令。
+
+> 想内置更多模型？改 `scripts/fetch-models.mjs` 里的 `MODELS`，同时把新模型 id 加进
+> `src/lib/constants.ts` 的 `BUILTIN_MODELS`。
+</details>
+
+<details>
+<summary><b>模型下载很慢？</b></summary>
+
+内置模型随站点一起发布，从本站目录读取，通常几秒到几十秒就能下载完（Tiny 约 43 MB，Base 约 76 MB），
+下载后由浏览器 `Cache Storage` 缓存，之后离线也能用。若确实很慢，先换 **Tiny** 跑通。
 </details>
 
 <details>

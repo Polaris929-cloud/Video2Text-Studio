@@ -3,6 +3,7 @@
  */
 
 import type { AsrSettings, LanguageOption, LlmSettings, ModelSpec } from '../types';
+import { DEFAULT_MODEL_SOURCE } from './modelSources';
 
 /**
  * 模型来自 Hugging Face 上 ONNX 化的 Whisper（Xenova / onnx-community 出品），
@@ -40,17 +41,17 @@ export const DEFAULT_ASR: AsrSettings = {
   device: 'auto',
   dtype: 'q8',
   engineSource: 'auto',
-  modelHost: '',
-  localModel: false,
+  modelSource: DEFAULT_MODEL_SOURCE,
+  customModelHost: '',
   chunkSeconds: 30,
   strideSeconds: 5,
 };
 
-/** 模型下载源候选（国内访问 huggingface.co 不通时的镜像） */
-export const MODEL_HOSTS: Array<{ value: string; label: string }> = [
-  { value: '', label: '官方 huggingface.co' },
-  { value: 'https://hf-mirror.com/', label: '国内镜像 hf-mirror.com' },
-];
+/**
+ * 站点自带的同源模型（由 scripts/fetch-models.mjs 在构建时下载到 public/models/）。
+ * 这些模型不依赖 huggingface.co，国内可直接使用。
+ */
+export const BUILTIN_MODELS: string[] = ['onnx-community/whisper-tiny', 'onnx-community/whisper-base'];
 
 /** 引擎 CDN 候选 */
 export const ENGINE_SOURCE_OPTIONS: Array<{ value: string; label: string }> = [

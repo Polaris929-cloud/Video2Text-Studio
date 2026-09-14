@@ -28,7 +28,19 @@ function writeJson(key: string, value: unknown): void {
   }
 }
 
-export const loadAsrSettings = (): AsrSettings => readJson(STORAGE_KEYS.asr, DEFAULT_ASR);
+export const loadAsrSettings = (): AsrSettings => {
+  const raw = readJson<AsrSettings & { modelHost?: string; localModel?: boolean }>(STORAGE_KEYS.asr, DEFAULT_ASR);
+  // 旧版本（v1.0）用的是「模型下载源」下拉 + 「本地模型目录」开关：
+  //   - modelHost 有值 → 迁移成自定义地址，继续当兜底源使用；
+  //   - 丢掉已经废弃的 localModel 字段。
+  const legacyHost = typeof raw.modelHost === 'string' ? raw.modelHost.trim() : '';
+  const { modelHost: _dropHost, localModel: _dropLocal, ...rest } = raw;
+  return {
+    ...DEFAULT_ASR,
+    ...rest,
+    customModelHost: rest.customModelHost || legacyHost,
+  };
+};
 export const saveAsrSettings = (s: AsrSettings) => writeJson(STORAGE_KEYS.asr, s);
 
 export const loadLlmSettings = (): LlmSettings => readJson(STORAGE_KEYS.llm, DEFAULT_LLM);

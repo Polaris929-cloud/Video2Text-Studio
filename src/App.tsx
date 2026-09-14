@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { extractAudio } from './lib/audio';
-import { DEFAULT_ASR, DEFAULT_LLM, ENGINE_SOURCE_OPTIONS, LANGUAGES, LLM_PRESETS, MODELS, MODEL_HOSTS } from './lib/constants';
+import { DEFAULT_ASR, DEFAULT_LLM, ENGINE_SOURCE_OPTIONS, LANGUAGES, LLM_PRESETS, MODELS, BUILTIN_MODELS } from './lib/constants';
+import { MODEL_SOURCE_OPTIONS, normalizeHost } from './lib/modelSources';
 import { buildExport, downloadText, formatClock, safeBaseName, type ExportFormat } from './lib/format';
 import { summarizeLocal } from './lib/summarize';
 import { summarizeWithLlm, testLlmConnection } from './lib/llm';
@@ -159,14 +160,17 @@ export default function App() {
       const result = await client.transcribe(audio.samples, asr, {
         onStatus: (message) => setNote(message),
         onProgress: ({ stage: s, value, note: n }) => {
+          // 进度条分三段：解码音轨 0~5%、加载模型 5~15%、语音识别 15~100%。
+          // 这样"下载模型"阶段也有可视化进度，不会再出现"0% 一动不动"。
+          const ratio = Math.max(0, Math.min(1, value));
           if (s === 'load') {
             setStage('loading-model');
-            setProgress(value);
-            setNote(n ? `下载模型：${n}` : '正在下载模型…');
+            setProgress(0.05 + ratio * 0.1);
+            setNote(n ? `下载模型：${n}` : '正在准备模型…');
           } else {
             setStage('transcribing');
-            setProgress(value);
-            setNote(`语音识别中 ${n ?? `${Math.round(value * 100)}%`}`);
+            setProgress(0.15 + ratio * 0.85);
+            setNote(`语音识别中 ${n ?? `${Math.round(ratio * 100)}%`}`);
           }
         },
       });
@@ -390,16 +394,34 @@ export default function App() {
               <small>重叠可减少切片边界丢词</small>
             </label>
             <label>
-              <span>模型下载源</span>
-              <select value={asr.modelHost} onChange={(e) => setAsr({ ...asr, modelHost: e.target.value })}>
-                {MODEL_HOSTS.map((h) => (
-                  <option key={h.value || 'official'} value={h.value}>
-                    {h.label}
+              <span>模型来源</span>
+              <select value={asr.modelSource} onChange={(e) => setAsr({ ...asr, modelSource: e.target.value })}>
+                {MODEL_SOURCE_OPTIONS.map((s) => (
+                  <option key={s.value} value={s.value}>
+                    {s.label}
                   </option>
                 ))}
               </select>
-              <small>若模型一直停在 0%（下载不动），多半是连不上 huggingface.co，请换镜像</small>
+              <small>
+                推荐「自动」：会依次探测各个来源，用能通的那个。<strong>本站同源</strong>
+                模型随站点一起部署，国内无需任何外网，也不受浏览器 CORS 限制
+                （huggingface.co 及其镜像在浏览器里通常会被 CORS 拦住）
+              </small>
             </label>
+            {asr.modelSource === 'custom' && (
+              <label>
+                <span>自定义模型地址</span>
+                <input
+                  value={asr.customModelHost}
+                  placeholder="https://你的镜像域名/"
+                  onChange={(e) => setAsr({ ...asr, customModelHost: e.target.value })}
+                />
+                <small>
+                  需兼容 Hugging Face 目录结构：<code>{'{模型id}/resolve/main/{文件名}'}</code>
+                  {asr.customModelHost && ` → 实际使用：${normalizeHost(asr.customModelHost)}`}
+                </small>
+              </label>
+            )}
             <label>
               <span>引擎 CDN 源</span>
               <select value={asr.engineSource} onChange={(e) => setAsr({ ...asr, engineSource: e.target.value })}>
@@ -409,36 +431,14 @@ export default function App() {
                   </option>
                 ))}
               </select>
-              <small>加载不出来时换一个 CDN 试试</small>
-            </label>
-            <label>
-              <span>本地模型目录（离线用）</span>
-              <input
-                value={asr.localModel ? asr.model : ''}
-                disabled={!asr.localModel}
-                placeholder="例如：D:/models/whisper-base"
-                onChange={(e) => setAsr({ ...asr, model: e.target.value })}
-              />
-              <small>
-                勾选下面的开关后，这里填本地文件夹路径，直接读本地 ONNX 模型，**完全不联网**
-              </small>
+              <small>加载不出来时换一个 CDN 试试（jsDelivr 通常可用）</small>
             </label>
           </div>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={asr.localModel}
-              onChange={(e) => setAsr({ ...asr, localModel: e.target.checked })}
-            />
-            <span>从本地文件夹加载模型（绕过 huggingface.co，适合网络不通的环境）</span>
-          </label>
-          {asr.localModel && (
-            <p className="hint">
-              目录需包含 <code>config.json</code>、<code>tokenizer.json</code>、<code>preprocessor_config.json</code> 以及{' '}
-              <code>onnx/encoder_model_quantized.onnx</code>、<code>onnx/decoder_model_merged_quantized.onnx</code>。
-              若浏览器阻止读取（Edge/Chrome 会询问文件夹权限），请允许访问。
-            </p>
-          )}
+          <p className="hint">
+            已内置的离线模型：{BUILTIN_MODELS.map((m) => m.split('/').pop()).join(' / ')}（q8 精度）。
+            选这两个模型时，模型文件与站点同源，一次下载后会被浏览器缓存，之后离线也能用。
+            其他模型（Small / Large-v3-Turbo）体积较大未内置，需要能访问 huggingface.co 才能下载。
+          </p>
           <div className="panel-footer">
             <button className="btn btn-ghost" onClick={() => setAsr(DEFAULT_ASR)}>
               恢复默认
@@ -632,6 +632,14 @@ export default function App() {
             <div className="card error-card">
               <strong>出错了</strong>
               <pre>{error}</pre>
+              <div className="file-actions">
+                <button className="btn btn-primary" onClick={start}>
+                  重试
+                </button>
+                <button className="btn btn-ghost" onClick={() => setPanel('asr')}>
+                  检查「模型来源」设置
+                </button>
+              </div>
             </div>
           )}
 

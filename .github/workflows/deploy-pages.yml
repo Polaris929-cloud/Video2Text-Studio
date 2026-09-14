@@ -30,6 +30,32 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # 内置 Whisper 模型（q8）必须随站点一起部署：
+      # 浏览器端加载模型只认「本站同源」这一条稳的路 —— huggingface.co 在国内被阻断，
+      # 而 hf-mirror 等镜像返回的 CORS 响应头只允许 huggingface.co，第三方站点会被浏览器拦截。
+      # 模型文件体积大，不入库，改在构建时下载（GitHub Actions 位于海外，可直连官方源）。
+      - name: Cache built-in models
+        uses: actions/cache@v4
+        with:
+          path: public/models
+          key: v2t-models-${{ runner.os }}-${{ hashFiles('scripts/fetch-models.mjs') }}
+          restore-keys: |
+            v2t-models-${{ runner.os }}-
+
+      # 下载失败不阻断部署：站点仍可用「自定义来源」，并会给出可读的错误提示而不是卡死。
+      - name: Fetch built-in models
+        run: npm run fetch:models
+        continue-on-error: true
+
+      - name: Verify built-in models
+        run: |
+          if [ -f public/models/manifest.json ]; then
+            cat public/models/manifest.json
+            du -sh public/models
+          else
+            echo "::warning::没有内置模型，同源来源将不可用"
+          fi
+
       - name: Run self tests
         run: npm test
 

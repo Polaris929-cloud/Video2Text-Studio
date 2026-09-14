@@ -4,6 +4,7 @@
 
 import type { AsrSettings, Segment, WorkerInMessage, WorkerOutMessage } from '../types';
 import { TARGET_SAMPLE_RATE } from './audio';
+import { resolveSiteBase } from './modelSources';
 
 export interface TranscribeCallbacks {
   onStatus?: (message: string) => void;
@@ -128,8 +129,9 @@ export class WhisperClient {
         chunkSeconds: settings.chunkSeconds,
         strideSeconds: settings.strideSeconds,
         engineSource: settings.engineSource,
-        modelHost: settings.modelHost,
-        localModel: settings.localModel,
+        modelSource: settings.modelSource,
+        customModelHost: settings.customModelHost,
+        siteBase: resolveSiteBase(document.baseURI),
       };
       // 用 transferable 传大数组，避免拷贝
       worker.postMessage(payload, [audio.buffer]);
