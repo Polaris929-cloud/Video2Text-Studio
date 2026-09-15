@@ -24,9 +24,25 @@
  *          绝不无限等待；
  *       ③ 每秒推送一次心跳进度（含已用时长、当前文件、已下载字节），进度条始终在动；
  *       ④ 首选来源是「本站同源」（模型与站点一起部署，无 CORS、不被墙、可离线）。
+ *
+ * ★ 语言为什么必须"自己检测"（本项目踩过的第二个坑）：
+ *   transformers.js 3.x 的 ASR pipeline **没有实现语言自动检测**，
+ *   源码里就是 `// TODO: Implement language detection` + `language = 'en'`。
+ *   也就是说：只要不显式传 language，**所有音频都会被当成英语解码**。
+ *   中文/日文/韩文音频被按英语解码时，Whisper 不会报错，而是开始"编造"——
+ *   输出 `[Spanish]`、`(Speaking in Japanese)`，或者一小段外文短语无限重复。
+ *   用户看到的就是"明明是中文视频，却识别出一堆看不懂的重复文本"。
+ *
+ *   这里的做法：
+ *       ① 用户显式选了语言 → 直接用（并校验该模型是否支持该语言）；
+ *       ② 选「自动检测」→ 自己实现检测：取音频里最"响"的 30 秒，
+ *          跑一次编码器 + 解码器首步，看语言 token 的概率分布（约 1 秒）；
+ *       ③ 检测失败 → 按浏览器语言兜底（而不是默认英语）；
+ *       ④ 识别结果再做一遍幻觉过滤（标记型 / 循环型 / 相邻重复 / 全片重复），
+ *          静音分片直接跳过，避免在没人说话的地方产出垃圾字幕。
  */
 
-import type { RawSegment, WorkerInMessage, WorkerOutMessage } from '../types';
+import type { LanguageSource, RawSegment, WorkerInMessage, WorkerOutMessage } from '../types';
 import {
   buildDeviceChain,
   buildDtypeChain,
@@ -35,6 +51,10 @@ import {
   pathTemplateFor,
   type ModelSourceSpec,
 } from '../lib/modelSources';
+import { analyzeLevel, isQuietChunk } from '../lib/audio';
+import { filterChunkSegments, findGloballyRepeating } from '../lib/hallucination';
+import { detectLanguage } from '../lib/langDetect';
+import { guessLanguageFromNavigator, isSupportedByModel, languageLabel, whisperCodeOf } from '../lib/whisperLang';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type AnyFn = (...args: any[]) => any;
@@ -750,24 +770,109 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
   } = msg;
   const totalSeconds = audio.length / 16000;
 
+  // 预热（客户端用极短静音触发）：只要把模型加载好，不做任何识别
+  if (totalSeconds < 1) {
+    await getPipeline(model, device, dtype, engineSource, modelSource, customModelHost, siteBase);
+    post({ type: 'result', segments: [], language, duration: totalSeconds });
+    return;
+  }
+
+  /* ── 音轨体检 ─────────────────────────────────────────────
+   * 音轨是纯静音时（视频没声音 / 解码失败），Whisper 会"自信地"编出一堆固定套路
+   * 的幻觉文本（`[BLANK_AUDIO]`、某句话无限循环……）。与其让用户看到垃圾字幕，
+   * 不如直接说清楚问题出在音轨上。
+   */
+  const level = analyzeLevel(audio);
+  if (level.peak < 1e-4) {
+    throw new Error(
+      `提取到的音轨几乎是静音（峰值 ${level.peak.toExponential(1)}），没有可识别的声音。\n` +
+        `常见原因：\n` +
+        `  1. 该视频本身没有音轨，或音轨是纯静音；\n` +
+        `  2. 浏览器没能解码出声音（编码不被支持）。\n` +
+        `建议：用播放器确认视频确实有声音，或先把音轨导出为 WAV / MP3 再试。`,
+    );
+  }
+
   const pipe = await getPipeline(model, device, dtype, engineSource, modelSource, customModelHost, siteBase);
   if (aborted) return;
 
-  const callOptions: Record<string, unknown> = {
+  /* ── 语言解析（本文件最关键的一步）─────────────────────────
+   * transformers.js 不传 language 时**一律按英语解码**（源码里就是
+   * `// TODO: Implement language detection` + 默认 'en'）。
+   * 中文音频被当成英语解码时，Whisper 会开始"编造"外文句子或无限重复同一段文本，
+   * 于是中文视频识别出来全是看不懂的乱码。
+   *
+   * 所以「自动检测」必须自己实现：用编码器 + 解码器首步取语言 token 分布（约 1 秒）。
+   * 检测不出来时也绝不默认英语，而是按浏览器语言兜底。
+   */
+  const pipeAny = pipe as any; // getPipeline 返回的是可调用对象，内部结构按库的约定取用
+  const langToId = (pipeAny?.model?.generation_config?.lang_to_id ?? {}) as Record<string, number>;
+  let resolved: {
+    code: string;
+    label: string;
+    source: LanguageSource;
+    confidence?: number;
+    alternates: string[];
+  } | null = null;
+
+  if (language && language !== 'auto') {
+    const code = whisperCodeOf(language);
+    if (code && isSupportedByModel(code, langToId)) {
+      resolved = { code, label: languageLabel(code), source: 'manual', alternates: [] };
+    } else {
+      // 例如 whisper-tiny/base 并没有粤语（yue）—— 硬传会让模型拿到 undefined token 进而胡言乱语
+      post({ type: 'status', message: `当前模型不支持「${language}」，改为自动检测语种…` });
+    }
+  }
+
+  if (!resolved) {
+    post({ type: 'status', message: '正在自动检测语种…' });
+    const detected = await detectLanguage(pipeAny, audio, transformersModule ?? {}, { isAborted: () => aborted });
+    if (aborted) return;
+
+    if (detected) {
+      resolved = {
+        code: detected.code,
+        label: detected.label,
+        source: 'auto',
+        confidence: detected.confidence,
+        alternates: detected.ranked
+          .slice(1)
+          .map((item) => item.code)
+          .filter((code) => isSupportedByModel(code, langToId)),
+      };
+      post({
+        type: 'status',
+        message: `自动检测语种：${detected.label}（${detected.code}）· 置信度 ${Math.round(detected.confidence * 100)}%`,
+      });
+    } else {
+      let code = guessLanguageFromNavigator();
+      if (!isSupportedByModel(code, langToId)) code = 'en';
+      resolved = { code, label: languageLabel(code), source: 'fallback', alternates: [] };
+      post({
+        type: 'status',
+        message: `未能自动检测语种，暂按「${resolved.label}」识别；如不正确请在「识别设置」里手动指定`,
+      });
+    }
+  }
+
+  const buildOptions = (lang: string) => ({
     return_timestamps: true,
     chunk_length_s: 30,
     stride_length_s: 5,
-  };
-  if (language && language !== 'auto') {
-    // 显式指定语言可跳过模型的语言探测，更快也更准。
-    // 'auto' 时这里什么都不传——transformers.js 会自动检测语言。
-    callOptions.language = language;
-    callOptions.task = 'transcribe';
-  }
+    // 显式指定语言，绝不让库退回英语默认值
+    language: lang,
+    task: 'transcribe',
+    // transformers.js 默认不做 n-gram 重复惩罚（默认 0），这里显式打开，
+    // 直接压制"同一句话无限循环"这一最常见的幻觉形态
+    no_repeat_ngram_size: 3,
+  });
 
   const raw: RawSegment[] = [];
   let cursor = 0;
   let guard = 0;
+  let filteredCount = 0;
+  let skippedSilentChunks = 0;
 
   while (cursor < totalSeconds - 0.05 && !aborted) {
     guard++;
@@ -778,11 +883,45 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
     const to = Math.min(audio.length, Math.ceil(end * 16000));
     const slice = audio.subarray(from, to);
 
-    const out = await pipe(slice, callOptions);
-    if (aborted) return;
+    // 严格前进，避免死循环
+    const minStep = Math.max(0.5, Math.min(strideSeconds, chunkSeconds * 0.9));
 
-    const segments = normalizeOutput(out);
-    const usable = segments.filter((s) => isMeaningful(s.text));
+    // 整片静音：跳过。静音是幻觉的头号诱因，识别它既费时又只会产出垃圾
+    if (isQuietChunk(slice, level.rms)) {
+      skippedSilentChunks++;
+      let next = end - strideSeconds;
+      if (!(next > cursor)) next = cursor + minStep;
+      if (totalSeconds - next < Math.min(minStep, 1)) break;
+      cursor = next;
+      post({
+        type: 'progress',
+        stage: 'transcribe',
+        value: Math.min(1, end / totalSeconds),
+        note: `${cursor.toFixed(0)}s / ${totalSeconds.toFixed(0)}s · 静音段已跳过`,
+      });
+      continue;
+    }
+
+    // 首选语种识别；若整片都被判为幻觉（很可能是语种猜错了），换第二候选再试一次
+    const candidates =
+      resolved.source === 'auto' && (resolved.confidence ?? 1) < 0.8 && resolved.alternates.length > 0
+        ? [resolved.code, resolved.alternates[0]]
+        : [resolved.code];
+
+    let usable: RawSegment[] = [];
+    let droppedHere = 0;
+    for (const lang of candidates) {
+      const out = await pipe(slice, buildOptions(lang));
+      if (aborted) return;
+      const outcome = filterChunkSegments(
+        normalizeOutput(out).filter((item) => isMeaningful(item.text)),
+        raw[raw.length - 1]?.text,
+      );
+      usable = outcome.kept;
+      droppedHere = outcome.dropped.length;
+      if (usable.length > 0) break;
+    }
+    filteredCount += droppedHere;
 
     // 组装带上绝对时间戳的片段，并记录本片最后结束时间
     let lastEnd = end;
@@ -813,7 +952,6 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
     });
 
     // 计算下一个切片起点。无论走哪条分支，都必须严格前进，否则会死循环。
-    const minStep = Math.max(0.5, Math.min(strideSeconds, chunkSeconds * 0.9));
     let next: number;
     if (advanced) {
       // 从最后一条字幕的结束时间继续：保留重叠、不丢词
@@ -828,7 +966,22 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
     cursor = next;
   }
 
-  post({ type: 'result', segments: raw, language, duration: totalSeconds });
+  // 全片兜底：同一句话一字不差出现 4 次以上，基本只可能是幻觉循环（真实语音不会这样）
+  const repeats = findGloballyRepeating(raw);
+  const segments = repeats.size > 0 ? raw.filter((_, index) => !repeats.has(index)) : raw;
+  if (repeats.size > 0) filteredCount += repeats.size;
+
+  post({
+    type: 'result',
+    segments,
+    language: resolved.code,
+    languageLabel: resolved.label,
+    languageSource: resolved.source,
+    languageConfidence: resolved.confidence,
+    filtered: filteredCount,
+    skippedSilentChunks,
+    duration: totalSeconds,
+  });
 }
 
 self.onmessage = async (event: MessageEvent<WorkerInMessage>) => {

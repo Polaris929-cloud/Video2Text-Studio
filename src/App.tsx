@@ -7,7 +7,18 @@ import { summarizeLocal } from './lib/summarize';
 import { summarizeWithLlm, testLlmConnection } from './lib/llm';
 import { loadAsrSettings, loadLastResult, loadLlmSettings, saveAsrSettings, saveLastResult, saveLlmSettings } from './lib/storage';
 import { WhisperClient } from './lib/transcribe';
-import type { AsrSettings, LlmSettings, Segment, Stage, SummaryResult } from './types';
+import type { AsrSettings, LanguageSource, LlmSettings, Segment, Stage, SummaryResult } from './types';
+
+/** 把语种信息拼成给用户看的一句话（自动检测要说明置信度，兜底要说明原因） */
+function languageSummary(info: { label: string; source?: LanguageSource; confidence?: number } | null): string {
+  if (!info) return '';
+  if (info.source === 'auto') {
+    const pct = info.confidence ? ` ${Math.round(info.confidence * 100)}%` : '';
+    return `语言 ${info.label}（自动检测${pct}）`;
+  }
+  if (info.source === 'fallback') return `语言 ${info.label}（未能检测，按系统语言推断）`;
+  return `语言 ${info.label}`;
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -44,6 +55,19 @@ export default function App() {
   const [summary, setSummary] = useState<SummaryResult | null>(null);
   const [summaryBusy, setSummaryBusy] = useState(false);
   const [detectedLanguage, setDetectedLanguage] = useState<string>('');
+  /**
+   * 语种的完整信息（展示名 / 来源 / 置信度）。
+   * 为什么不能只存语言代码：识别结果里的语言可能是「自动检测」出来的，
+   * 界面上要能说清"检测到了什么、有多确定"，用户才能判断要不要手动指定。
+   */
+  const [languageInfo, setLanguageInfo] = useState<{
+    code: string;
+    label: string;
+    source?: LanguageSource;
+    confidence?: number;
+  } | null>(null);
+  /** 过滤提示：有多少条疑似幻觉字幕被丢掉 / 多少段静音被跳过 */
+  const [filterNote, setFilterNote] = useState('');
   const [audioDuration, setAudioDuration] = useState(0);
   const [query, setQuery] = useState('');
   const [activeIndex, setActiveIndex] = useState(-1);
@@ -130,6 +154,8 @@ export default function App() {
       setSegments([]);
       setSummary(null);
       setDetectedLanguage('');
+      setLanguageInfo(null);
+      setFilterNote('');
       setAudioDuration(0);
       setError('');
       setProgress(0);
@@ -187,6 +213,23 @@ export default function App() {
 
       setSegments(result.segments);
       setDetectedLanguage(result.language ?? '');
+      setLanguageInfo(
+        result.language
+          ? {
+              code: result.language,
+              label: result.languageLabel ?? result.language,
+              source: result.languageSource,
+              confidence: result.languageConfidence,
+            }
+          : null,
+      );
+      {
+        // 幻觉过滤 / 静音跳过要给用户一个交代，否则"少了几条字幕"会让人困惑
+        const parts: string[] = [];
+        if ((result.filtered ?? 0) > 0) parts.push(`过滤掉 ${result.filtered} 条疑似无人声 / 重复的幻觉字幕`);
+        if ((result.skippedSilentChunks ?? 0) > 0) parts.push(`跳过 ${result.skippedSilentChunks} 段静音`);
+        setFilterNote(parts.join('，'));
+      }
       setStage('done');
       setProgress(1);
       setNote(`识别完成，共 ${result.segments.length} 条字幕`);
@@ -361,7 +404,7 @@ export default function App() {
                   </option>
                 ))}
               </select>
-              <small>指定语言比自动检测更准、更快</small>
+              <small>「自动检测」会在识别开始时先判断语种（约 1 秒）；若字幕明显不对，直接指定语言最稳</small>
             </label>
             <label>
               <span>计算设备</span>
@@ -590,7 +633,8 @@ export default function App() {
                   <span>
                     {formatBytes(file.size)}
                     {audioDuration > 0 && ` · 时长 ${formatClock(audioDuration)}`}
-                    {detectedLanguage && ` · 语言 ${detectedLanguage}`}
+                    {(languageInfo || detectedLanguage) &&
+                      ` · ${languageInfo ? languageSummary(languageInfo) : `语言 ${detectedLanguage}`}`}
                   </span>
                 </div>
                 <div className="file-actions">
@@ -642,6 +686,12 @@ export default function App() {
                 />
               </div>
               {note && <p className="hint note">{note}</p>}
+              {stage === 'done' && filterNote && <p className="hint note">已{filterNote}</p>}
+              {stage === 'done' && languageInfo?.source !== 'manual' && languageInfo && (
+                <button className="btn btn-ghost btn-sm" onClick={() => setPanel('asr')}>
+                  语言识别不对？手动指定视频语言
+                </button>
+              )}
             </div>
           )}
 

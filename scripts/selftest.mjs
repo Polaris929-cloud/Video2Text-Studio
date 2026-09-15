@@ -13,7 +13,7 @@ const outDir = mkdtempSync(join(tmpdir(), 'v2t-selftest-'));
 
 // 用 esbuild（vite 自带依赖）把 TS 模块编译成 ESM 供 Node 直接运行
 const entry = join(outDir, 'entry.ts');
-const modules = ['summarize', 'format'];
+const modules = ['summarize', 'format', 'hallucination', 'whisperLang'];
 writeFileSync(
   entry,
   modules.map((m) => `export * from ${JSON.stringify(join(root, 'src/lib', `${m}.ts`).replaceAll('\\', '/'))};`).join('\n'),
@@ -94,6 +94,64 @@ check('英文也能出关键词', enSum.keywords.length > 0, enSum.keywords.join
 
 check('空输入不崩溃', lib.summarizeLocal([]).bullets.length === 0);
 check('句子切分按标点', lib.buildSentences(longSegs).length >= 3, String(lib.buildSentences(longSegs).length));
+
+/* ---------- hallucination（幻觉过滤）---------- */
+console.log('\n[hallucination]');
+// 用户实际遇到的那种：中文视频被当成英语解码后，输出一小段外文无限重复
+const loop = 'będziemyęgrać FER fundo MUSANG '.repeat(5).trim();
+check('循环型幻觉被识别', lib.looksHallucinated(loop), lib.repetitionRatio(loop).toFixed(2));
+check('标记型幻觉 [Spanish]', lib.looksHallucinated('[Spanish]'));
+check('标记型幻觉 (Speaking in Japanese)', lib.looksHallucinated('(Speaking in Japanese)'));
+check('标记型幻觉 [BLANK_AUDIO]', lib.looksHallucinated('[BLANK_AUDIO]'));
+check('符号型幻觉 ♪♪♪', lib.looksHallucinated('♪♪♪'));
+check('套话幻觉（点赞订阅）', lib.looksHallucinated('请不吝点赞订阅转发打赏支持明镜与点点栏目'));
+check('套话幻觉（Amara 字幕组）', lib.looksHallucinated('字幕由 Amara.org 社区提供'));
+check(
+  '中文长句重复也判为幻觉',
+  lib.looksHallucinated('请不吝点赞订阅转发打赏支持明镜与点点栏目'.repeat(4)),
+);
+// 正常内容绝不能被误伤
+check('正常中文不会被误判', !lib.looksHallucinated('大家好，欢迎来到云原神的动画短片第二篇，今天讲讲游戏里的角色设计。'));
+check('正常英文不会被误判', !lib.looksHallucinated('And so my fellow Americans, ask not what your country can do for you.'));
+check('正常重复词不会被误判', !lib.looksHallucinated('好的好的，那我们就这么说定了，明天上午九点在公司楼下见。'));
+check(
+  '长句中含"订阅"不误判',
+  !lib.looksHallucinated('如果你想继续了解这个系列的内容，可以点击订阅按钮，我们每周更新一期视频，感谢大家的支持与陪伴。'),
+);
+
+const chunk = lib.filterChunkSegments([
+  { text: '[MUSIC]' },
+  { text: '这是第一句真正的内容。' },
+  { text: '这是第一句真正的内容。' },
+  { text: loop },
+  { text: '这是第二句真正的内容。' },
+]);
+check('过滤后只剩真实内容', chunk.kept.length === 2, chunk.kept.map((k) => k.text).join(' | '));
+check('相邻完全重复被判为 duplicate', chunk.dropped.some((d) => d.reason === 'duplicate'));
+check('循环文本被判为 repeat', chunk.dropped.some((d) => d.reason === 'repeat'));
+
+const many = Array.from({ length: 5 }, (_, i) => ({ text: '相同的一句幻觉文本内容' }));
+check('全片重复的句子会被整体剔除', lib.findGloballyRepeating(many).size === 5);
+check(
+  '短语气词不参与全片重复判定',
+  lib.findGloballyRepeating(Array.from({ length: 6 }, () => ({ text: '嗯' }))).size === 0,
+);
+
+/* ---------- whisperLang（语种映射）---------- */
+console.log('\n[whisperLang]');
+check("whisperCodeOf('chinese') === 'zh'", lib.whisperCodeOf('chinese') === 'zh');
+check("whisperCodeOf('zh') === 'zh'", lib.whisperCodeOf('zh') === 'zh');
+check("whisperCodeOf('auto') === null", lib.whisperCodeOf('auto') === null);
+check("whisperCodeOf('cantonese') === 'yue'", lib.whisperCodeOf('cantonese') === 'yue');
+check("languageLabel('zh') === '中文'", lib.languageLabel('zh') === '中文');
+check("languageLabel('en') === '英语'", lib.languageLabel('en') === '英语');
+check('语言表覆盖 99 种', Object.keys(lib.WHISPER_LANGUAGE_LABELS).length === 99, String(Object.keys(lib.WHISPER_LANGUAGE_LABELS).length));
+// 模型不支持的语言必须能被识别出来（否则会往 prompt 里塞 undefined token）
+check('粤语在 whisper-base 里不受支持', lib.isSupportedByModel('yue', { '<|zh|>': 50260 }) === false);
+check('中文在 whisper-base 里受支持', lib.isSupportedByModel('zh', { '<|zh|>': 50260 }) === true);
+check('浏览器语言兜底 zh-CN → zh', lib.guessLanguageFromNavigator({ language: 'zh-CN', languages: ['zh-CN', 'en'] }) === 'zh');
+check('浏览器语言兜底 en-US → en', lib.guessLanguageFromNavigator({ language: 'en-US', languages: ['en-US'] }) === 'en');
+check('未知浏览器语言兜底 en', lib.guessLanguageFromNavigator({ language: 'xx-YY' }) === 'en');
 
 rmSync(outDir, { recursive: true, force: true });
 

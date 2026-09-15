@@ -2,7 +2,7 @@
  * 语音识别客户端：主线程侧对 Worker 的封装。
  */
 
-import type { AsrSettings, Segment, WorkerInMessage, WorkerOutMessage } from '../types';
+import type { AsrSettings, LanguageSource, Segment, WorkerInMessage, WorkerOutMessage } from '../types';
 import { TARGET_SAMPLE_RATE } from './audio';
 import { resolveSiteBase } from './modelSources';
 
@@ -20,6 +20,16 @@ export interface TranscribeCallbacks {
 export interface TranscribeResult {
   segments: Segment[];
   language?: string;
+  /** 语言展示名，例如 中文 */
+  languageLabel?: string;
+  /** 语言是怎么定下来的：手动指定 / 自动检测 / 兜底 */
+  languageSource?: LanguageSource;
+  /** 自动检测的置信度 0~1 */
+  languageConfidence?: number;
+  /** 被过滤掉的疑似幻觉片段数 */
+  filtered?: number;
+  /** 因静音被跳过的分片数 */
+  skippedSilentChunks?: number;
   duration: number;
 }
 
@@ -104,6 +114,11 @@ export class WhisperClient {
             resolve({
               segments: normalizeSegments(msg.segments),
               language: msg.language,
+              languageLabel: msg.languageLabel,
+              languageSource: msg.languageSource,
+              languageConfidence: msg.languageConfidence,
+              filtered: msg.filtered,
+              skippedSilentChunks: msg.skippedSilentChunks,
               duration: msg.duration,
             });
             break;

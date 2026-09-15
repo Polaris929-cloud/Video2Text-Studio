@@ -27,6 +27,9 @@ export interface LanguageOption {
 /** 进度阶段 */
 export type Stage = 'idle' | 'decoding' | 'loading-model' | 'transcribing' | 'done' | 'error';
 
+/** 语言是怎么定下来的：手动指定 / 自动检测 / 检测失败后的兜底 */
+export type LanguageSource = 'manual' | 'auto' | 'fallback';
+
 /** Worker → 主线程 消息 */
 export type WorkerOutMessage =
   | {
@@ -38,7 +41,23 @@ export type WorkerOutMessage =
       phase?: 'probe' | 'download' | 'compile';
     }
   | { type: 'status'; message: string }
-  | { type: 'result'; segments: RawSegment[]; language?: string; duration: number }
+  | {
+      type: 'result';
+      segments: RawSegment[];
+      /** Whisper 语言代码，例如 zh */
+      language?: string;
+      /** 语言展示名，例如 中文 */
+      languageLabel?: string;
+      /** 语言是怎么定下来的 */
+      languageSource?: LanguageSource;
+      /** 自动检测的置信度（0~1） */
+      languageConfidence?: number;
+      /** 被过滤掉的疑似幻觉片段数 */
+      filtered?: number;
+      /** 因整片静音被跳过的分片数 */
+      skippedSilentChunks?: number;
+      duration: number;
+    }
   | { type: 'error'; message: string };
 
 /** Worker 输出的原始片段（时间戳可能为 null 表示未知） */

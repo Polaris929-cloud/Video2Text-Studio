@@ -13,6 +13,116 @@
 /** Whisper 固定采样率 */
 export const TARGET_SAMPLE_RATE = 16000;
 
+/** 音频能量体检结果 */
+export interface AudioLevel {
+  /** 整段均方根 */
+  rms: number;
+  /** 峰值绝对值 */
+  peak: number;
+  /** 估算的有效发声秒数（按帧能量统计） */
+  voicedSeconds: number;
+  /** 时长（秒） */
+  duration: number;
+}
+
+/**
+ * 检查音轨能量。
+ * 用途：
+ *   1. 音轨几乎是静音时（解码失败 / 视频本来没声音）直接给出可读错误，
+ *      而不是让 Whisper 在静音上"编"出一堆幻觉文本；
+ *   2. 为「跳过纯静音分片」和「语种检测取哪 30 秒」提供依据。
+ */
+export function analyzeLevel(samples: Float32Array, sampleRate = TARGET_SAMPLE_RATE): AudioLevel {
+  const n = samples.length;
+  const duration = n / sampleRate;
+  if (n === 0) return { rms: 0, peak: 0, voicedSeconds: 0, duration: 0 };
+
+  let sumSq = 0;
+  let peak = 0;
+  for (let i = 0; i < n; i++) {
+    const v = samples[i];
+    sumSq += v * v;
+    const a = v < 0 ? -v : v;
+    if (a > peak) peak = a;
+  }
+  const rms = Math.sqrt(sumSq / n);
+
+  // 以 0.25 秒为一帧统计"有效发声"时长
+  const frame = Math.max(1, Math.round(sampleRate * 0.25));
+  const threshold = Math.max(0.002, rms * 0.3);
+  let voicedFrames = 0;
+  const frames = Math.floor(n / frame);
+  for (let f = 0; f < frames; f++) {
+    let acc = 0;
+    const start = f * frame;
+    for (let i = start; i < start + frame; i++) {
+      const v = samples[i];
+      acc += v * v;
+    }
+    if (Math.sqrt(acc / frame) >= threshold) voicedFrames++;
+  }
+
+  return { rms, peak, voicedSeconds: (voicedFrames * frame) / sampleRate, duration };
+}
+
+/**
+ * 语种检测只需要 30 秒 —— 但要挑"有声音"的那 30 秒。
+ * 直接取开头可能是片头静音/纯音乐，检测出来的语种会不准。
+ * 这里按 0.5 秒步长滑动，取能量最高的窗口。
+ */
+export function pickDetectionWindow(
+  samples: Float32Array,
+  seconds = 30,
+  sampleRate = TARGET_SAMPLE_RATE,
+): Float32Array {
+  const windowSize = Math.round(seconds * sampleRate);
+  if (samples.length <= windowSize) return samples.slice();
+
+  const hop = Math.max(1, Math.round(sampleRate * 0.5));
+  let bestStart = 0;
+  let bestEnergy = -1;
+  for (let start = 0; start + windowSize <= samples.length; start += hop) {
+    let acc = 0;
+    // 采样求和即可，不必逐点（窗口内均匀抽样，速度与效果都够用）
+    const step = Math.max(1, Math.floor(windowSize / 3000));
+    for (let i = start; i < start + windowSize; i += step) {
+      const v = samples[i];
+      acc += v * v;
+    }
+    if (acc > bestEnergy) {
+      bestEnergy = acc;
+      bestStart = start;
+    }
+  }
+  return samples.slice(bestStart, bestStart + windowSize);
+}
+
+/**
+ * 这一片是否"几乎没声音"。
+ * 参照整段 RMS 做相对判断，避免整体音量偏小的视频被误判。
+ */
+export function isQuietChunk(samples: Float32Array, referenceRms: number, sampleRate = TARGET_SAMPLE_RATE): boolean {
+  if (samples.length === 0) return true;
+  const frame = Math.max(1, Math.round(sampleRate * 0.25));
+  let sumSq = 0;
+  let loudFrames = 0;
+  const threshold = Math.max(0.0015, referenceRms * 0.12);
+  const frames = Math.floor(samples.length / frame);
+  for (let f = 0; f < frames; f++) {
+    let acc = 0;
+    const start = f * frame;
+    for (let i = start; i < start + frame; i++) {
+      const v = samples[i];
+      acc += v * v;
+      sumSq += v * v;
+    }
+    if (Math.sqrt(acc / frame) >= threshold) loudFrames++;
+  }
+  // 连 0.5 秒像样声音都没有 → 视为静音片
+  return loudFrames * 0.25 < 0.5;
+}
+
+
 export interface DecodedAudio {
   /** 16 kHz 单声道 PCM */
   samples: Float32Array;
