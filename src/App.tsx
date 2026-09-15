@@ -823,7 +823,9 @@ export default function App() {
           识别模型来自 Hugging Face 上的 Whisper（transformers.js + ONNX Runtime Web），首次使用需联网下载并缓存到浏览器；
           视频与音频<strong>全程不离开你的设备</strong>。
         </span>
-        <span className="hint">Video2Text Studio · 开源静态站点</span>
+        <span className="hint" title="用于确认页面是否已更新到最新版本">
+          Video2Text Studio · 开源静态站点 · 版本 {__BUILD_COMMIT__}（{__BUILD_TIME__}）
+        </span>
       </footer>
     </div>
   );
