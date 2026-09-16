@@ -152,14 +152,36 @@ check(
   foreignSamples.every((t) => lib.looksHallucinated(t, { language: 'zh' })),
   foreignSamples.filter((t) => !lib.looksHallucinated(t, { language: 'zh' })).join(' | '),
 );
+/* ★ 本次修复的核心：判据不能依赖"检测结果是中文"。
+   检测一旦给错语言（例如把中文音频判成英语），旧实现就完全不再过滤，
+   乱码会全线放行、原样显示给用户。以下三条锁死这个行为。 */
+const crossScriptSamples = foreignSamples.filter((t) =>
+  /[\uAC00-\uD7AF\u0400-\u04FF\u0370-\u03FF]/.test(t),
+);
 check(
-  '不指定中文语种时不启用该判定（英文内容照常保留）',
+  '检测给错语言（en）时，跨语系乱码仍被拦住',
+  crossScriptSamples.length > 0 &&
+    crossScriptSamples.every((t) => lib.looksHallucinated(t, { language: 'en' })),
+  crossScriptSamples.filter((t) => !lib.looksHallucinated(t, { language: 'en' })).join(' | '),
+);
+check(
+  '完全未指定语言时，跨语系乱码仍被拦住',
+  crossScriptSamples.every((t) => lib.looksHallucinated(t)),
+  crossScriptSamples.filter((t) => !lib.looksHallucinated(t)).join(' | '),
+);
+check(
+  '英文内容在英语目标下照常保留',
   !lib.looksHallucinated('And so my fellow Americans, ask not what your country can do for you.', { language: 'en' }),
 );
-// 正常的中英混说绝不能被误伤
+
+// 各语言正常文本绝不能被误伤
 check('中英混说不会被误伤', !lib.looksHallucinated('我们用 Python 处理数据，再用 pandas 做可视化。', { language: 'zh' }));
 check('含英文专名的中文句不会被误伤', !lib.looksHallucinated('这台 MacBook 的电池续航大约十小时。', { language: 'zh' }));
-check('日文中出现的汉字词不会被误伤', !lib.looksHallucinated('他昨天去了日本和韩国出差。', { language: 'zh' }));
+check('中文句里含日本/韩国等词不会被误伤', !lib.looksHallucinated('他昨天去了日本和韩国出差。', { language: 'zh' }));
+check('中文技术内容里的希腊符号（10Ω）不会被误伤', !lib.looksHallucinated('这个电阻的阻值是 10Ω，误差百分之五。', { language: 'zh' }));
+check('正常日语（假名+汉字）不会被误伤', !lib.looksHallucinated('これは日本語のテストです。', { language: 'ja' }));
+check('正常韩语不会被误伤', !lib.looksHallucinated('안녕하세요 오늘 날씨가 좋네요.', { language: 'ko' }));
+check('正常俄语不会被误伤', !lib.looksHallucinated('Привет, как ваши дела сегодня?', { language: 'ru' }));
 
 const foreignChunk = lib.filterChunkSegments(
   [{ text: 'Chevl coal gema造' }, { text: '这是正常的中文字幕内容。' }],

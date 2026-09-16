@@ -77,52 +77,151 @@ export function isArtifactTag(text: string): boolean {
   return false;
 }
 
-/* ── 目标语言一致性（中文场景）──────────────────────────────
- * 即使把语言强制成中文，Whisper 遇到**没有人声的段落**（背景音乐、掌声、噪声）
- * 依然会"自由发挥"，而且会跨语言乱跳，例如：
+/* ── 语言一致性 / 跨语系乱码 ────────────────────────────────
+ * Whisper 遇到**没有人声的段落**（背景音乐、掌声、噪声）或语言指定错误时，
+ * 会"自由发挥"并跨语言乱跳，例如：
  *
  *   FamehuhnNI arbeiten Loadabolic Fraser 쭈운 thoughνΩ Vent decree reign livest
  *   Chevl coal gema造
  *
  * 这类文本既不含标记、也不构成循环重复，光靠上面两条规则**完全拦不住**，
  * 于是用户看到的就是一屏韩文、俄文、波兰语混杂的"字幕"。
- * 但它们在中文语境下有个共同特征：**出现了与中文毫无关系的文字**。
+ *
+ * ⚠ 关键设计：**判据不能依赖"目标语言是中文"**。
+ * 语种检测本身可能给出错误答案（那正是幻觉的成因之一），
+ * 如果只在检测结果为 zh 时才过滤，检测一旦出错，乱码就会被全部放行。
+ * 因此下面把判据拆成两部分，其中「跨语系文字混用」与目标语言无关，
+ * 在任何情况下都能拦住这类乱码。
  */
 
-/** 与中文无关的字符：西里尔、韩文音节、日文假名、希腊、泰文、阿拉伯、希伯来 */
-const FOREIGN_SCRIPT =
-  /[\u0400-\u04FF\uAC00-\uD7AF\u3040-\u30FF\u0370-\u03FF\u0E00-\u0E7F\u0590-\u05FF\u0600-\u06FF]/g;
+/** 各文字系统的字符统计用正则 */
+const SCRIPT_PATTERNS: Record<string, RegExp> = {
+  /** 拉丁字母，含带变音符号的扩展拉丁（ę ç ß ż ł 等 Whisper 幻觉常见字符） */
+  latin: /[A-Za-z\u00C0-\u024F]/g,
+  /** 汉字（含扩展区）——"日本""咖啡"这类词算汉字，不会被误伤 */
+  cjk: /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/g,
+  /** 日文假名 */
+  kana: /[\u3040-\u30FF]/g,
+  /** 韩文音节 */
+  hangul: /[\uAC00-\uD7AF]/g,
+  /** 西里尔字母 */
+  cyrillic: /[\u0400-\u04FF]/g,
+  /** 希腊字母 */
+  greek: /[\u0370-\u03FF]/g,
+  /** 泰文 */
+  thai: /[\u0E00-\u0E7F]/g,
+  /** 阿拉伯字母 */
+  arabic: /[\u0600-\u06FF]/g,
+  /** 希伯来字母 */
+  hebrew: /[\u0590-\u05FF]/g,
+};
 
-/** 汉字（含扩展区）——"日本""咖啡"这类词算汉字，不会被误伤 */
-const CJK_CHAR = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/g;
+export type ScriptName = keyof typeof SCRIPT_PATTERNS;
 
-/** 拉丁字母，含带变音符号的扩展拉丁（ę ç ß ż ł 等 Whisper 幻觉常见字符） */
-const LATIN_CHAR = /[A-Za-z\u00C0-\u024F]/g;
+/** 使用西里尔字母的语系 */
+const CYRILLIC_LANGS = [
+  'ru',
+  'uk',
+  'be',
+  'bg',
+  'sr',
+  'mk',
+  'kk',
+  'ky',
+  'tg',
+  'mn',
+  'tt',
+  'ba',
+  'cv',
+  'os',
+  'uz',
+  'tk',
+  'sah',
+];
+
+function countScripts(text: string): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const name of Object.keys(SCRIPT_PATTERNS)) {
+    out[name] = (text.match(SCRIPT_PATTERNS[name]) || []).length;
+  }
+  return out;
+}
 
 /**
- * 中文场景下，这段文本是否"不可能属于中文内容"。
+ * 「专属文字系统」：正常情况下只会出现在特定语系的文字。
+ * 中文视频里蹦出韩文 / 西里尔 / 希腊字母 → 一定是幻觉，
+ * **与语种检测结果是否正确无关**（这正是它能兜住检测失败的原因）。
  *
- * 判据：
- *  1. 出现韩文/西里尔/假名/泰文… 两个字符以上 —— 中文视频里只可能是幻觉；
- *  2. 一个汉字都没有、却有一长串拉丁词（整句英文/波兰语/德语…）；
- *  3. 汉字极少、拉丁字母却压倒性地多（`Chevl coal gema造`）。
- *
- * 正常的中英混说（`我们用 Python 写代码`）汉字占多数，不会命中。
+ * minCount 的取值有讲究：韩文音节/假名/西里尔不可能作为数学符号出现，出现 1 个即可判；
+ * 希腊字母则常被当作符号使用（`10Ω`、`α 粒子`），要求 ≥2 个才判，避免误伤技术类内容。
  */
-export function isForeignText(text: string): boolean {
+const EXCLUSIVE_SCRIPTS: Array<{ script: string; languages: string[]; minCount: number }> = [
+  { script: 'hangul', languages: ['ko'], minCount: 1 },
+  { script: 'kana', languages: ['ja'], minCount: 1 },
+  { script: 'cyrillic', languages: CYRILLIC_LANGS, minCount: 1 },
+  { script: 'greek', languages: ['el'], minCount: 2 },
+  { script: 'thai', languages: ['th'], minCount: 1 },
+  { script: 'hebrew', languages: ['he', 'yi'], minCount: 1 },
+  { script: 'arabic', languages: ['ar', 'fa', 'ur', 'ps', 'sd', 'ug'], minCount: 1 },
+];
+
+/** 目标语言期望的文字系统（未收录的语言按拉丁字母处理） */
+function expectedScript(language?: string): ScriptName | null {
+  if (!language) return null;
+  if (language === 'zh') return 'cjk';
+  if (language === 'ja') return 'kana';
+  if (language === 'ko') return 'hangul';
+  if (language === 'el') return 'greek';
+  if (language === 'th') return 'thai';
+  if (['he', 'yi'].includes(language)) return 'hebrew';
+  if (['ar', 'fa', 'ur', 'ps', 'sd', 'ug'].includes(language)) return 'arabic';
+  if (CYRILLIC_LANGS.includes(language)) return 'cyrillic';
+  return 'latin';
+}
+
+/**
+ * 这段文本是否"不可能属于目标语言"。
+ *
+ * 判据 1（与目标语言无关，最可靠）：出现不属于目标语系的「专属文字」，
+ *   例如中文/英文结果里混进韩文音节、西里尔字母、希腊字母。
+ *   30 秒内的真实语音不可能这样跨语系混用。
+ * 判据 2：整段完全没有目标语言的文字，却有一长串别种文字
+ *   （中文场景下即「一个汉字都没有，却是一长串拉丁词」）。
+ * 判据 3：目标语言的文字只是零星点缀，别的文字压倒性多（`Chevl coal gema造`）。
+ *
+ * 正常的中英混说（`我们用 Python 处理数据`）汉字占多数，三条都不会命中。
+ */
+export function isForeignText(text: string, language?: string): boolean {
   const t = text || '';
   if (!t) return false;
-  if ((t.match(FOREIGN_SCRIPT) || []).length >= 2) return true;
 
-  const cjk = (t.match(CJK_CHAR) || []).length;
-  const latin = (t.match(LATIN_CHAR) || []).length;
-  if (cjk === 0 && latin >= 12) return true;
-  if (cjk > 0 && latin >= 8 && latin > cjk * 2) return true;
+  const counts = countScripts(t);
+  const lang = language ?? '';
+
+  // 判据 1：跨语系的「专属文字」—— 与检测结果对不对无关
+  for (const { script, languages, minCount } of EXCLUSIVE_SCRIPTS) {
+    if (counts[script] >= minCount && !languages.includes(lang)) return true;
+  }
+
+  const target = expectedScript(language);
+  if (!target) return false;
+
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  if (total < 8) return false;
+
+  const expected = counts[target];
+
+  // 判据 2：整段用错了文字系统
+  if (expected === 0) return true;
+
+  // 判据 3：目标语言文字占比不足 25% —— 正常语音不会这样
+  if (expected * 3 < total - expected) return true;
+
   return false;
 }
 
 export interface FilterOptions {
-  /** 目标语言（Whisper 代码）。为 'zh' 时启用上面的一致性校验 */
+  /** 目标语言（Whisper 代码，如 'zh'/'en'）。用于判断结果是否与目标语言一致 */
   language?: string;
 }
 
@@ -130,7 +229,9 @@ export interface FilterOptions {
 export function looksHallucinated(text: string, options: FilterOptions = {}): boolean {
   if (isArtifactTag(text)) return true;
   if (repetitionRatio(text) >= 0.55) return true;
-  if (options.language === 'zh' && isForeignText(text)) return true;
+  // 注意：这里刻意**不再限定** "language === 'zh'"。
+  // 语种检测本身可能出错，只在检测为中文时才过滤，等于检测一错就全线放行。
+  if (isForeignText(text, options.language)) return true;
   return false;
 }
 
@@ -170,8 +271,9 @@ export function filterChunkSegments<T extends { text: string }>(
       dropped.push({ item, reason: 'repeat' });
       continue;
     }
-    // 目标语言是中文，却吐出了韩文/俄文/波兰语…… 这不是"识别不准"，而是幻觉
-    if (options.language === 'zh' && isForeignText(item.text)) {
+    // 吐出了与目标语言无关的文字（韩文/西里尔/希腊…），或整段用错语言
+    // —— 这不是"识别不准"，而是幻觉。判据不依赖检测结果是否正确。
+    if (isForeignText(item.text, options.language)) {
       dropped.push({ item, reason: 'foreign' });
       continue;
     }

@@ -235,10 +235,17 @@ export default function App() {
         const kept = result.segments.length;
         if (filtered > 0) parts.push(`过滤掉 ${filtered} 条疑似无人声 / 重复的幻觉字幕`);
         if ((result.skippedSilentChunks ?? 0) > 0) parts.push(`跳过 ${result.skippedSilentChunks} 段静音`);
-        // 过滤掉的远多于保留下来的，说明这条视频大部分时间没有人声（音乐 / 噪声），
-        // 得把原因讲明白，否则用户只看到"几乎没有字幕"会更困惑
-        if (filtered >= 10 && filtered > kept * 2) {
-          parts.push('该视频大部分片段没有中文人声（可能是背景音乐或噪声），因此未生成字幕');
+        if (kept === 0) {
+          // 一条字幕都没留下时，最可能的原因是语言判断与实际人声不匹配。
+          // 与其让用户对着空结果发愁，不如把原因和下一步直接写清楚。
+          parts.push(
+            '识别完成，但没有留下任何可用字幕。最常见的原因是语言判断与视频里实际的人声不符 —— ' +
+              '请到「识别设置」把「语言」手动指定为视频的实际语言（中文视频选「中文」）后重试；' +
+              '若仍然不行，把模型换成更大的 Small（中文明显更准）通常能改善',
+          );
+        } else if (filtered >= 10 && filtered > kept * 2) {
+          // 过滤掉的远多于保留下来的，说明这条视频大部分时间没有人声（音乐 / 噪声）
+          parts.push('该视频大部分片段没有可识别的人声（可能是背景音乐或噪声），因此未生成字幕');
         }
         setFilterNote(parts.join('，'));
       }
