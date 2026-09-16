@@ -54,7 +54,13 @@ import {
 import { analyzeLevel, isQuietChunk } from '../lib/audio';
 import { filterChunkSegments, findGloballyRepeating } from '../lib/hallucination';
 import { detectLanguage } from '../lib/langDetect';
-import { guessLanguageFromNavigator, isSupportedByModel, languageLabel, whisperCodeOf } from '../lib/whisperLang';
+import {
+  UI_LANGUAGE,
+  guessLanguageFromNavigator,
+  isSupportedByModel,
+  languageLabel,
+  whisperCodeOf,
+} from '../lib/whisperLang';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type AnyFn = (...args: any[]) => any;
@@ -859,6 +865,36 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
     }
   }
 
+  /* ── 预期语言：过滤判据的基准 ──────────────────────────────
+   * 必须与「正在尝试解码的语言」分开，否则会形成自证循环：
+   * 用德语解码出的德语幻觉，拿德语当判据去检验，当然条条"合法"，
+   * 于是第一片就锁定德语，整片再也轮不到中文 —— 这正是"中文视频识别出
+   * 满屏德语/英语乱码"的根因。
+   *
+   * 这里以「用户意图」为准，优先级：
+   *   手动选择 > 高置信度的自动检测 > 浏览器/界面语言 > 检测结果
+   * 「自信地给出错误答案」在音乐干扰下很常见，所以只有检测置信度足够高
+   * 才采信它；否则退回浏览器语言（中文用户即中文）——这是唯一独立于
+   * 「检测」这条链路的信息源。
+   */
+  const fallbackLang = (() => {
+    // 界面语言（本站为中文）优先级高于浏览器语言：装英文系统看中文视频的人不少，
+    // 而"在用中文界面"这个事实本身就是很强的信号。
+    if (isSupportedByModel(UI_LANGUAGE, langToId)) return UI_LANGUAGE;
+    const nav = guessLanguageFromNavigator();
+    return isSupportedByModel(nav, langToId) ? nav : resolved.code;
+  })();
+  const detectedTrustworthy = resolved.source === 'auto' && (resolved.confidence ?? 0) >= 0.85;
+  const expectLang =
+    resolved.source === 'manual' ? resolved.code : detectedTrustworthy ? resolved.code : fallbackLang;
+
+  if (resolved.source === 'auto' && expectLang !== resolved.code) {
+    post({
+      type: 'status',
+      message: `检测到「${resolved.label}」，但将优先按「${languageLabel(expectLang)}」尝试（可在「识别设置」里手动指定语言）`,
+    });
+  }
+
   const buildOptions = (lang: string) => ({
     return_timestamps: true,
     chunk_length_s: 30,
@@ -926,13 +962,38 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
       const outcome = filterChunkSegments(
         normalizeOutput(out).filter((item) => isMeaningful(item.text)),
         raw[raw.length - 1]?.text,
-        { language: lang },
+        // ⚠ 判据固定用 expectLang，绝不能传 lang！
+        // 传 lang 会让"用某语言解出的该语言幻觉"自我证明为合法内容，
+        // 从而在第一片就锁定错误语言，中文再也没有机会被尝试。
+        { language: expectLang },
       );
       usable = outcome.kept;
       droppedHere = outcome.dropped.length;
       if (usable.length > 0) {
         lockedLang = lang; // 认准这个语言，后面不再试别的
         break;
+      }
+    }
+
+    // 兜底：所有候选都被「预期语言一致性」拦空，说明预期语言本身可能不对
+    // （典型的：中文界面下用户在识别英文视频）。仅在整片第一片这么做——
+    // 放弃语言判据，只拦跨语系乱码与循环重复，避免一次错误的语言判断
+    // 让用户拿到一个彻头彻尾的空结果。
+    if (usable.length === 0 && droppedHere > 0 && cursor === 0) {
+      for (const lang of tryOrder) {
+        const out = await pipe(slice, buildOptions(lang));
+        if (aborted) return;
+        const outcome = filterChunkSegments(
+          normalizeOutput(out).filter((item) => isMeaningful(item.text)),
+          undefined,
+          // 不传 language：只启用于语言无关的判据
+        );
+        usable = outcome.kept;
+        droppedHere += outcome.dropped.length;
+        if (usable.length > 0) {
+          lockedLang = lang;
+          break;
+        }
       }
     }
     filteredCount += droppedHere;

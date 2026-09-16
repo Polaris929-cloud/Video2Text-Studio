@@ -175,6 +175,15 @@ export function isSupportedByModel(code: string, langToId: Record<string, number
  * 自动检测失败时的兜底：按浏览器/系统语言猜一个。
  * 比"直接当成英语"靠谱得多（英语是 transformers.js 的默认值，也是幻觉的主要来源）。
  */
+/**
+ * 本站界面语言。当前站点只有中文界面，所以它就是「用户大概率在处理什么语言的内容」
+ * 最可靠的线索 —— 比浏览器语言更可靠（不少人装的是英文系统，看的却是中文视频）。
+ *
+ * 用途：语种自动检测不可信时的兜底依据（见 asr.worker.ts 里的 expectLang）。
+ * 注意这是**兜底**，不是硬约束：用户手动选的语言永远优先。
+ */
+export const UI_LANGUAGE = 'zh';
+
 export function guessLanguageFromNavigator(nav?: { language?: string; languages?: readonly string[] }): string {
   const navObj = nav ?? (typeof navigator !== 'undefined' ? navigator : undefined);
   const candidates: string[] = [];
