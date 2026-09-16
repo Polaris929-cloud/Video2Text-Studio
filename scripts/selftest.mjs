@@ -137,6 +137,40 @@ check(
   lib.findGloballyRepeating(Array.from({ length: 6 }, () => ({ text: '嗯' }))).size === 0,
 );
 
+/* 跨语言幻觉：中文视频里混进韩文/俄文/波兰语 —— 以下均为用户实际截图中的原文 */
+const foreignSamples = [
+  'FamehuhnNI arbeiten Loadabolic Fraser 쭈운 thoughνΩ Vent decree reign livest',
+  'Easubby toxinsчикчабыrin Informationen zwr Cooperζ」fists retaining',
+  'Ultimagebraç FER fundo MUSANG będziemygebraç trze shorts Hokмент',
+  'Bundesregierungabyrin Informationen RTX Remnow Councillors эфф',
+  'wiecoinhuhNI Japan peril zak illuminhuhNihn insulin alltid Clock',
+  'Chevl coal gema造',
+  'landsca좋 lol Tomorrowwitez',
+];
+check(
+  '中文场景下多语言乱码 → 判为幻觉',
+  foreignSamples.every((t) => lib.looksHallucinated(t, { language: 'zh' })),
+  foreignSamples.filter((t) => !lib.looksHallucinated(t, { language: 'zh' })).join(' | '),
+);
+check(
+  '不指定中文语种时不启用该判定（英文内容照常保留）',
+  !lib.looksHallucinated('And so my fellow Americans, ask not what your country can do for you.', { language: 'en' }),
+);
+// 正常的中英混说绝不能被误伤
+check('中英混说不会被误伤', !lib.looksHallucinated('我们用 Python 处理数据，再用 pandas 做可视化。', { language: 'zh' }));
+check('含英文专名的中文句不会被误伤', !lib.looksHallucinated('这台 MacBook 的电池续航大约十小时。', { language: 'zh' }));
+check('日文中出现的汉字词不会被误伤', !lib.looksHallucinated('他昨天去了日本和韩国出差。', { language: 'zh' }));
+
+const foreignChunk = lib.filterChunkSegments(
+  [{ text: 'Chevl coal gema造' }, { text: '这是正常的中文字幕内容。' }],
+  undefined,
+  { language: 'zh' },
+);
+check(
+  '分片过滤丢掉跨语言幻觉、保留正常中文',
+  foreignChunk.kept.length === 1 && foreignChunk.dropped[0]?.reason === 'foreign',
+);
+
 /* ---------- whisperLang（语种映射）---------- */
 console.log('\n[whisperLang]');
 check("whisperCodeOf('chinese') === 'zh'", lib.whisperCodeOf('chinese') === 'zh');

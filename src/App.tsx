@@ -13,8 +13,13 @@ import type { AsrSettings, LanguageSource, LlmSettings, Segment, Stage, SummaryR
 function languageSummary(info: { label: string; source?: LanguageSource; confidence?: number } | null): string {
   if (!info) return '';
   if (info.source === 'auto') {
-    const pct = info.confidence ? ` ${Math.round(info.confidence * 100)}%` : '';
-    return `语言 ${info.label}（自动检测${pct}）`;
+    // 多段采样出现分歧时置信度会明显偏低，此时报一个"51%"只会让人困惑，
+    // 说明"已综合多段判断"更有意义
+    const detail =
+      info.confidence && info.confidence >= 0.7
+        ? `，置信度 ${Math.round(info.confidence * 100)}%`
+        : '，已综合多段采样';
+    return `语言 ${info.label}（自动检测${detail}）`;
   }
   if (info.source === 'fallback') return `语言 ${info.label}（未能检测，按系统语言推断）`;
   return `语言 ${info.label}`;
@@ -226,8 +231,15 @@ export default function App() {
       {
         // 幻觉过滤 / 静音跳过要给用户一个交代，否则"少了几条字幕"会让人困惑
         const parts: string[] = [];
-        if ((result.filtered ?? 0) > 0) parts.push(`过滤掉 ${result.filtered} 条疑似无人声 / 重复的幻觉字幕`);
+        const filtered = result.filtered ?? 0;
+        const kept = result.segments.length;
+        if (filtered > 0) parts.push(`过滤掉 ${filtered} 条疑似无人声 / 重复的幻觉字幕`);
         if ((result.skippedSilentChunks ?? 0) > 0) parts.push(`跳过 ${result.skippedSilentChunks} 段静音`);
+        // 过滤掉的远多于保留下来的，说明这条视频大部分时间没有人声（音乐 / 噪声），
+        // 得把原因讲明白，否则用户只看到"几乎没有字幕"会更困惑
+        if (filtered >= 10 && filtered > kept * 2) {
+          parts.push('该视频大部分片段没有中文人声（可能是背景音乐或噪声），因此未生成字幕');
+        }
         setFilterNote(parts.join('，'));
       }
       setStage('done');

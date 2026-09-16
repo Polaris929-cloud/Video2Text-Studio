@@ -826,7 +826,7 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
   }
 
   if (!resolved) {
-    post({ type: 'status', message: '正在自动检测语种…' });
+    post({ type: 'status', message: '正在自动检测语种（前 / 中 / 后分段采样）…' });
     const detected = await detectLanguage(pipeAny, audio, transformersModule ?? {}, { isAborted: () => aborted });
     if (aborted) return;
 
@@ -841,9 +841,12 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
           .map((item) => item.code)
           .filter((code) => isSupportedByModel(code, langToId)),
       };
+      // 多段采样有分歧时置信度天然偏低，报百分比反而让人误以为"不可靠"
+      const detail =
+        detected.confidence >= 0.7 ? ` · 置信度 ${Math.round(detected.confidence * 100)}%` : ' · 已综合多段采样';
       post({
         type: 'status',
-        message: `自动检测语种：${detected.label}（${detected.code}）· 置信度 ${Math.round(detected.confidence * 100)}%`,
+        message: `自动检测语种：${detected.label}（${detected.code}）${detail}`,
       });
     } else {
       let code = guessLanguageFromNavigator();
@@ -873,6 +876,8 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
   let guard = 0;
   let filteredCount = 0;
   let skippedSilentChunks = 0;
+  /** 一旦某个语言真正产出了内容，后续分片就沿用它，避免在错误候选上反复浪费 */
+  let lockedLang: string | null = null;
 
   while (cursor < totalSeconds - 0.05 && !aborted) {
     guard++;
@@ -902,24 +907,33 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
       continue;
     }
 
-    // 首选语种识别；若整片都被判为幻觉（很可能是语种猜错了），换第二候选再试一次
-    const candidates =
-      resolved.source === 'auto' && (resolved.confidence ?? 1) < 0.8 && resolved.alternates.length > 0
-        ? [resolved.code, resolved.alternates[0]]
-        : [resolved.code];
+    // 候选语言池：主选 + 若干备选。
+    // 不能只靠"检测胜出的那一个"——背景音乐会"自信地"给出完全错误的答案，
+    // 所以把检测里排前面的语言都留作候选；备选只会在主选一个可用片段都没产出时
+    // 才真正被送去解码，正常情况下不增加开销。
+    const candidates: string[] = [resolved.code, ...resolved.alternates.slice(0, 2)].filter(
+      (code, index, arr) => arr.indexOf(code) === index,
+    );
+    const tryOrder: string[] = lockedLang
+      ? [lockedLang, ...candidates.filter((code) => code !== lockedLang)]
+      : candidates;
 
     let usable: RawSegment[] = [];
     let droppedHere = 0;
-    for (const lang of candidates) {
+    for (const lang of tryOrder) {
       const out = await pipe(slice, buildOptions(lang));
       if (aborted) return;
       const outcome = filterChunkSegments(
         normalizeOutput(out).filter((item) => isMeaningful(item.text)),
         raw[raw.length - 1]?.text,
+        { language: lang },
       );
       usable = outcome.kept;
       droppedHere = outcome.dropped.length;
-      if (usable.length > 0) break;
+      if (usable.length > 0) {
+        lockedLang = lang; // 认准这个语言，后面不再试别的
+        break;
+      }
     }
     filteredCount += droppedHere;
 
@@ -971,13 +985,19 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
   const segments = repeats.size > 0 ? raw.filter((_, index) => !repeats.has(index)) : raw;
   if (repeats.size > 0) filteredCount += repeats.size;
 
+  // 最终语言以"真正产出字幕的那个"为准：
+  // 若检测被背景音乐带偏、而实际是用备选语言救回来的，就得如实报告，
+  // 否则界面会显示"波兰语"却输出中文字幕，用户只会更困惑。
+  const finalCode = lockedLang ?? resolved.code;
+  const switched = lockedLang !== null && lockedLang !== resolved.code;
+
   post({
     type: 'result',
     segments,
-    language: resolved.code,
-    languageLabel: resolved.label,
-    languageSource: resolved.source,
-    languageConfidence: resolved.confidence,
+    language: finalCode,
+    languageLabel: languageLabel(finalCode),
+    languageSource: switched ? 'auto' : resolved.source,
+    languageConfidence: switched ? undefined : resolved.confidence,
     filtered: filteredCount,
     skippedSilentChunks,
     duration: totalSeconds,

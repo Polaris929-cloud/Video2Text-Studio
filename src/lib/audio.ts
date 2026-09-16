@@ -101,6 +101,61 @@ export function pickDetectionWindow(
  * 这一片是否"几乎没声音"。
  * 参照整段 RMS 做相对判断，避免整体音量偏小的视频被误判。
  */
+/** 在 [from, to) 范围内找出能量最高的一个窗口 */
+function bestWindowIn(
+  samples: Float32Array,
+  from: number,
+  to: number,
+  windowSize: number,
+): Float32Array {
+  const first = Math.max(0, Math.min(from, samples.length - windowSize));
+  const last = Math.min(samples.length, Math.max(to, first + windowSize));
+  const hop = Math.max(1, Math.round(TARGET_SAMPLE_RATE * 0.5));
+  const step = Math.max(1, Math.floor(windowSize / 3000));
+
+  let bestStart = first;
+  let bestEnergy = -1;
+  for (let start = first; start + windowSize <= last; start += hop) {
+    let acc = 0;
+    for (let i = start; i < start + windowSize; i += step) {
+      const v = samples[i];
+      acc += v * v;
+    }
+    if (acc > bestEnergy) {
+      bestEnergy = acc;
+      bestStart = start;
+    }
+  }
+  return samples.slice(bestStart, bestStart + windowSize);
+}
+
+/**
+ * 取多个检测窗口（前 / 中 / 后段各一个，段内取能量最高处）。
+ *
+ * 只用"全片最响的 30 秒"是不可靠的：**背景音乐通常就是全片最响的部分**，
+ * 于是语种检测会被音乐带偏，整条视频都用错误的语言解码——
+ * 这正是中文视频识别出一堆波兰语/德语的原因。分段取样再投票可以显著降低这个风险。
+ */
+export function pickDetectionWindows(
+  samples: Float32Array,
+  seconds = 30,
+  count = 3,
+  sampleRate = TARGET_SAMPLE_RATE,
+): Float32Array[] {
+  const windowSize = Math.round(seconds * sampleRate);
+  if (samples.length <= windowSize) return [samples.slice()];
+
+  const parts = Math.max(1, Math.min(count, Math.floor(samples.length / windowSize)));
+  const partLen = Math.floor(samples.length / parts);
+  const out: Float32Array[] = [];
+  for (let k = 0; k < parts; k++) {
+    const from = k * partLen;
+    const to = k === parts - 1 ? samples.length : from + partLen;
+    out.push(bestWindowIn(samples, from, to, windowSize));
+  }
+  return out;
+}
+
 export function isQuietChunk(samples: Float32Array, referenceRms: number, sampleRate = TARGET_SAMPLE_RATE): boolean {
   if (samples.length === 0) return true;
   const frame = Math.max(1, Math.round(sampleRate * 0.25));

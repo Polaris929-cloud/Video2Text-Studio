@@ -77,17 +77,67 @@ export function isArtifactTag(text: string): boolean {
   return false;
 }
 
+/* ── 目标语言一致性（中文场景）──────────────────────────────
+ * 即使把语言强制成中文，Whisper 遇到**没有人声的段落**（背景音乐、掌声、噪声）
+ * 依然会"自由发挥"，而且会跨语言乱跳，例如：
+ *
+ *   FamehuhnNI arbeiten Loadabolic Fraser 쭈운 thoughνΩ Vent decree reign livest
+ *   Chevl coal gema造
+ *
+ * 这类文本既不含标记、也不构成循环重复，光靠上面两条规则**完全拦不住**，
+ * 于是用户看到的就是一屏韩文、俄文、波兰语混杂的"字幕"。
+ * 但它们在中文语境下有个共同特征：**出现了与中文毫无关系的文字**。
+ */
+
+/** 与中文无关的字符：西里尔、韩文音节、日文假名、希腊、泰文、阿拉伯、希伯来 */
+const FOREIGN_SCRIPT =
+  /[\u0400-\u04FF\uAC00-\uD7AF\u3040-\u30FF\u0370-\u03FF\u0E00-\u0E7F\u0590-\u05FF\u0600-\u06FF]/g;
+
+/** 汉字（含扩展区）——"日本""咖啡"这类词算汉字，不会被误伤 */
+const CJK_CHAR = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/g;
+
+/** 拉丁字母，含带变音符号的扩展拉丁（ę ç ß ż ł 等 Whisper 幻觉常见字符） */
+const LATIN_CHAR = /[A-Za-z\u00C0-\u024F]/g;
+
+/**
+ * 中文场景下，这段文本是否"不可能属于中文内容"。
+ *
+ * 判据：
+ *  1. 出现韩文/西里尔/假名/泰文… 两个字符以上 —— 中文视频里只可能是幻觉；
+ *  2. 一个汉字都没有、却有一长串拉丁词（整句英文/波兰语/德语…）；
+ *  3. 汉字极少、拉丁字母却压倒性地多（`Chevl coal gema造`）。
+ *
+ * 正常的中英混说（`我们用 Python 写代码`）汉字占多数，不会命中。
+ */
+export function isForeignText(text: string): boolean {
+  const t = text || '';
+  if (!t) return false;
+  if ((t.match(FOREIGN_SCRIPT) || []).length >= 2) return true;
+
+  const cjk = (t.match(CJK_CHAR) || []).length;
+  const latin = (t.match(LATIN_CHAR) || []).length;
+  if (cjk === 0 && latin >= 12) return true;
+  if (cjk > 0 && latin >= 8 && latin > cjk * 2) return true;
+  return false;
+}
+
+export interface FilterOptions {
+  /** 目标语言（Whisper 代码）。为 'zh' 时启用上面的一致性校验 */
+  language?: string;
+}
+
 /** 综合判断：这段文本是否应该被丢掉 */
-export function looksHallucinated(text: string): boolean {
+export function looksHallucinated(text: string, options: FilterOptions = {}): boolean {
   if (isArtifactTag(text)) return true;
   if (repetitionRatio(text) >= 0.55) return true;
+  if (options.language === 'zh' && isForeignText(text)) return true;
   return false;
 }
 
 export interface FilterOutcome<T> {
   kept: T[];
   /** 被丢掉的片段（含原因，便于界面提示与排查） */
-  dropped: Array<{ item: T; reason: 'artifact' | 'repeat' | 'duplicate' }>;
+  dropped: Array<{ item: T; reason: 'artifact' | 'repeat' | 'duplicate' | 'foreign' }>;
 }
 
 /** 去掉标点与空白后的"骨架"，用于比较两段文本是否其实一样 */
@@ -102,7 +152,11 @@ function skeleton(text: string): string {
  *   - 标记型/循环型幻觉直接丢；
  *   - 与上一条完全相同的相邻重复丢（滑窗重叠或幻觉循环都会造成这种重复）。
  */
-export function filterChunkSegments<T extends { text: string }>(items: T[], previousText?: string): FilterOutcome<T> {
+export function filterChunkSegments<T extends { text: string }>(
+  items: T[],
+  previousText?: string,
+  options: FilterOptions = {},
+): FilterOutcome<T> {
   const kept: T[] = [];
   const dropped: FilterOutcome<T>['dropped'] = [];
   let prev = previousText ? skeleton(previousText) : '';
@@ -114,6 +168,11 @@ export function filterChunkSegments<T extends { text: string }>(items: T[], prev
     }
     if (repetitionRatio(item.text) >= 0.55) {
       dropped.push({ item, reason: 'repeat' });
+      continue;
+    }
+    // 目标语言是中文，却吐出了韩文/俄文/波兰语…… 这不是"识别不准"，而是幻觉
+    if (options.language === 'zh' && isForeignText(item.text)) {
+      dropped.push({ item, reason: 'foreign' });
       continue;
     }
     const sk = skeleton(item.text);
