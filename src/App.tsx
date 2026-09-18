@@ -5,7 +5,17 @@ import { MODEL_SOURCE_OPTIONS, normalizeHost } from './lib/modelSources';
 import { buildExport, downloadText, formatClock, safeBaseName, type ExportFormat } from './lib/format';
 import { summarizeLocal } from './lib/summarize';
 import { summarizeWithLlm, testLlmConnection } from './lib/llm';
-import { loadAsrSettings, loadLastResult, loadLlmSettings, saveAsrSettings, saveLastResult, saveLlmSettings } from './lib/storage';
+import {
+  clearCheckpoint,
+  loadAsrSettings,
+  loadCheckpoint,
+  loadLastResult,
+  loadLlmSettings,
+  saveAsrSettings,
+  saveCheckpoint,
+  saveLastResult,
+  saveLlmSettings,
+} from './lib/storage';
 import { WhisperClient } from './lib/transcribe';
 import type { AsrSettings, LanguageSource, LlmSettings, Segment, Stage, SummaryResult } from './types';
 
@@ -30,6 +40,18 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+/** 把秒数写成"1 小时 5 分"这种好读的形式（用于预计剩余时间） */
+function formatDuration(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s} 秒`;
+  const m = Math.floor(s / 60);
+  const rest = s % 60;
+  if (m < 60) return rest > 0 ? `${m} 分 ${rest} 秒` : `${m} 分`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return mm > 0 ? `${h} 小时 ${mm} 分` : `${h} 小时`;
 }
 
 const STAGE_LABEL: Record<Stage, string> = {
@@ -73,6 +95,13 @@ export default function App() {
   } | null>(null);
   /** 过滤提示：有多少条疑似幻觉字幕被丢掉 / 多少段静音被跳过 */
   const [filterNote, setFilterNote] = useState('');
+  /**
+   * 识别速度与预计剩余时间。
+   * 长视频（例如 37 分钟）在 CPU 上跑，进度条可能几分钟才动一格，
+   * 界面上没有这两个数字，用户没法区分"在慢慢跑"和"卡死了"。
+   */
+  const [speed, setSpeed] = useState<number | null>(null);
+  const [etaMs, setEtaMs] = useState<number | null>(null);
   const [audioDuration, setAudioDuration] = useState(0);
   const [query, setQuery] = useState('');
   const [activeIndex, setActiveIndex] = useState(-1);
@@ -90,6 +119,14 @@ export default function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const restoredRef = useRef(false);
+  /** 最近一次中转存档的位置，用于「从中断处继续」 */
+  const checkpointRef = useRef<{ cursor: number; duration: number; fileName: string } | null>(null);
+  /** 页面上可见的存档提示（长视频中断后能一键续跑） */
+  const [pendingCheckpoint, setPendingCheckpoint] = useState<{ fileName: string; cursor: number; duration: number } | null>(
+    null,
+  );
+  /** 用户点了「从中断处继续」：下一次 start() 走续跑分支 */
+  const [resumeIntent, setResumeIntent] = useState(false);
 
   const busy = stage === 'decoding' || stage === 'loading-model' || stage === 'transcribing';
 
@@ -109,6 +146,12 @@ export default function App() {
       setDetectedLanguage(last.language ?? '');
       setStage('done');
       setNote(`已恢复上次的识别结果（${last.fileName}，${new Date(last.savedAt).toLocaleString()}）`);
+    }
+    // 有未完成的存档就提示续跑：长视频跑到一半刷新/关页面是常事
+    const cp = loadCheckpoint();
+    if (cp && cp.segments.length > 0) {
+      checkpointRef.current = { cursor: cp.cursor, duration: cp.duration, fileName: cp.fileName };
+      setPendingCheckpoint({ fileName: cp.fileName, cursor: cp.cursor, duration: cp.duration });
     }
   }, []);
 
@@ -172,11 +215,22 @@ export default function App() {
   );
 
   /* ---------------- 开始识别 ---------------- */
-  const start = useCallback(async () => {
+  /**
+   * @param options.resume 为 true 时从中转存档处继续（长视频中断后续跑，不重头再来）
+   */
+  const start = useCallback(async (options: { resume?: boolean } = {}) => {
     if (!file || busy) return;
+    const resumeFrom =
+      options.resume && checkpointRef.current && checkpointRef.current.fileName === file.name
+        ? checkpointRef.current.cursor
+        : 0;
+    const resuming = resumeFrom > 0;
+    setResumeIntent(false);
     setError('');
-    setSegments([]);
+    if (!resuming) setSegments([]);
     setSummary(null);
+    setSpeed(null);
+    setEtaMs(null);
     setStage('decoding');
     setProgress(0.05);
     setNote('正在解码音轨…');
@@ -189,7 +243,7 @@ export default function App() {
       setAudioDuration(audio.duration);
       setStage('loading-model');
       setLoadPhase('probe');
-      setNote('正在准备语音识别模型…');
+      setNote(resuming ? `正在准备模型（将从 ${formatClock(resumeFrom)} 处继续）…` : '正在准备语音识别模型…');
 
       if (!clientRef.current) clientRef.current = new WhisperClient();
       const client = clientRef.current;
@@ -198,7 +252,8 @@ export default function App() {
       // 因此下面的展示时长提前从 audio.duration 取好。
       const result = await client.transcribe(audio.samples, asr, {
         onStatus: (message) => setNote(message),
-        onProgress: ({ stage: s, value, note: n, phase: p }) => {
+        onProgress: (info) => {
+          const { stage: s, value, note: n, phase: p } = info;
           // 进度条分三段：解码音轨 0~5%、加载模型 5~15%、语音识别 15~100%。
           // 这样"下载模型"阶段也有可视化进度，不会再出现"0% 一动不动"。
           const ratio = Math.max(0, Math.min(1, value));
@@ -212,9 +267,19 @@ export default function App() {
             setProgress(0.15 + ratio * 0.85);
             setLoadPhase('transcribe');
             setNote(`语音识别中 ${n ?? `${Math.round(ratio * 100)}%`}`);
+            // 长视频里"看起来卡住"通常只是慢：把实时倍速与预计剩余时间显示出来，
+            // 用户就能判断是在推进还是真出问题了。
+            setSpeed(typeof info.speed === 'number' ? info.speed : null);
+            setEtaMs(typeof info.etaMs === 'number' ? info.etaMs : null);
           }
         },
-      });
+        onCheckpoint: (cp) => {
+          // 定期把已完成内容落盘：长视频中途中断/刷新后可以续跑，不必从零重来
+          setSegments(cp.segments);
+          checkpointRef.current = { cursor: cp.cursor, duration: cp.duration, fileName: file.name };
+          saveCheckpoint(checkpointRef.current, cp.segments);
+        },
+      }, { resumeFrom });
 
       setSegments(result.segments);
       setDetectedLanguage(result.language ?? '');
@@ -251,6 +316,9 @@ export default function App() {
       }
       setStage('done');
       setProgress(1);
+      // 跑完了，中转存档已完成使命
+      checkpointRef.current = null;
+      clearCheckpoint();
       setNote(`识别完成，共 ${result.segments.length} 条字幕`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -658,8 +726,8 @@ export default function App() {
                 </div>
                 <div className="file-actions">
                   {!busy ? (
-                    <button className="btn btn-primary" onClick={start}>
-                      {stage === 'done' ? '重新识别' : '开始识别'}
+                    <button className="btn btn-primary" onClick={() => void start({ resume: resumeIntent })}>
+                      {resumeIntent ? '从中断处继续' : stage === 'done' ? '重新识别' : '开始识别'}
                     </button>
                   ) : (
                     <button className="btn btn-danger" onClick={abort}>
@@ -690,6 +758,35 @@ export default function App() {
             </div>
           )}
 
+          {pendingCheckpoint && !busy && (
+            <div className="card resume-card">
+              <div>
+                <strong>发现未完成的识别进度</strong>
+                <p className="hint">
+                  「{pendingCheckpoint.fileName}」上次跑到 <strong>{formatClock(pendingCheckpoint.cursor)}</strong> /{' '}
+                  {formatClock(pendingCheckpoint.duration)}（约{' '}
+                  {Math.round((pendingCheckpoint.cursor / Math.max(1, pendingCheckpoint.duration)) * 100)}%）就中断了。
+                  识别结果已保存，可以继续跑，不用从头再来。
+                </p>
+              </div>
+              <div className="resume-actions">
+                <button className="btn btn-primary" onClick={() => setResumeIntent(true)} disabled={!file}>
+                  从 {formatClock(pendingCheckpoint.cursor)} 处继续
+                </button>                <button
+                  className="btn btn-ghost"
+                  onClick={() => {
+                    checkpointRef.current = null;
+                    clearCheckpoint();
+                    setPendingCheckpoint(null);
+                  }}
+                >
+                  丢弃存档
+                </button>
+              </div>
+              {!file && <p className="hint">请先重新导入同一个视频文件，再点「继续」。</p>}
+            </div>
+          )}
+
           {stage !== 'idle' && (
             <div className="card progress-card">
               <div className="progress-head">
@@ -705,6 +802,28 @@ export default function App() {
                 />
               </div>
               {note && <p className="hint note">{note}</p>}
+              {stage === 'transcribing' && (speed !== null || etaMs !== null) && (
+                <p className="hint speed-note">
+                  {speed !== null && (
+                    <>
+                      速度 <strong>{speed < 1 ? `${(1 / speed).toFixed(1)}× 实时` : `${speed.toFixed(1)}× 慢于实时`}</strong>
+                    </>
+                  )}
+                  {etaMs !== null && etaMs > 0 && (
+                    <>
+                      {speed !== null && ' · '}
+                      预计还需 <strong>{formatDuration(etaMs / 1000)}</strong>
+                    </>
+                  )}
+                  {etaMs === null && speed !== null && ' · 正在估算剩余时间…'}
+                </p>
+              )}
+              {stage === 'transcribing' && speed !== null && speed > 1.5 && (
+                <p className="hint warn-note">
+                  当前是 CPU 推理，长视频会很慢。建议：① 用 Edge/Chrome 并开启显卡加速（设置里「推理设备」选 WebGPU）；
+                  ② 换 Tiny 模型；③ 或改用「识别设置 → 语言」手动指定，可省掉语言尝试的额外开销。
+                </p>
+              )}
               {stage === 'done' && filterNote && <p className="hint note">已{filterNote}</p>}
               {stage === 'done' && languageInfo?.source !== 'manual' && languageInfo && (
                 <button className="btn btn-ghost btn-sm" onClick={() => setPanel('asr')}>
@@ -719,8 +838,16 @@ export default function App() {
               <strong>出错了</strong>
               <pre>{error}</pre>
               <div className="file-actions">
-                <button className="btn btn-primary" onClick={start}>
-                  重试
+                <button
+                  className="btn btn-primary"
+                  onClick={() =>
+                    void start({
+                      // 有存档就接着跑：长视频跑到一半出错，重试不该从零开始
+                      resume: Boolean(checkpointRef.current && checkpointRef.current.fileName === file?.name),
+                    })
+                  }
+                >
+                  {checkpointRef.current && checkpointRef.current.fileName === file?.name ? '从中断处重试' : '重试'}
                 </button>
                 <button className="btn btn-ghost" onClick={() => setPanel('asr')}>
                   检查「模型来源」设置

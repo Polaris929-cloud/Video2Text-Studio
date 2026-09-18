@@ -82,4 +82,6 @@ export const STORAGE_KEYS = {
   asr: 'v2t.asr.v1',
   llm: 'v2t.llm.v1',
   lastResult: 'v2t.lastResult.v1',
+  /** 长视频识别过程中的中转存档，用于中断后续跑 */
+  checkpoint: 'v2t.checkpoint.v1',
 } as const;

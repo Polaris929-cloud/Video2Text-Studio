@@ -745,6 +745,61 @@ function normalizeOutput(out: any): RawSegment[] {
   return segments;
 }
 
+/* ── 实时进度：速度 / 预计剩余时间 ─────────────────────────────
+ * 长视频里"卡在某个百分比"多半只是慢，不是死了。
+ * 这里以固定节奏上报已处理音频时长、实时倍速与预计剩余时间，
+ * 让界面能明确区分"在慢慢跑"和"真的卡住"。
+ */
+const PROGRESS_INTERVAL_MS = 400;
+let progressStartedAt = 0;
+let progressLastEmit = 0;
+let completedAudioSeconds = 0;
+let progressTotalSeconds = 0;
+let progressNoteSuffix = '';
+let resumeBaseSeconds = 0;
+
+function startProgressClock(totalSeconds: number, resumeFrom = 0) {
+  progressStartedAt = Date.now();
+  progressLastEmit = 0;
+  completedAudioSeconds = 0;
+  progressTotalSeconds = totalSeconds;
+  progressNoteSuffix = '';
+  resumeBaseSeconds = resumeFrom;
+}
+
+/** 本段任务相对续跑起点已推进的音频秒数（用于算速度） */
+function audioSpanSinceStart(cursor: number) {
+  return Math.max(0, cursor - resumeBaseSeconds);
+}
+
+/**
+ * 上报进度。force=true 时忽略节流（用于分片刚结束这种关键节点）。
+ */
+function emitTranscribeProgress(cursor: number, force = false) {
+  const now = Date.now();
+  if (!force && now - progressLastEmit < PROGRESS_INTERVAL_MS) return;
+  progressLastEmit = now;
+
+  const elapsedMs = Math.max(1, now - progressStartedAt);
+  const span = audioSpanSinceStart(cursor);
+  // speed：处理 1 秒音频需要多少秒（<1 表示比实时快）
+  const speed = span > 0.5 ? elapsedMs / 1000 / span : undefined;
+  const remaining = Math.max(0, progressTotalSeconds - cursor);
+  const etaMs = speed !== undefined && remaining > 0 ? Math.round(speed * remaining * 1000) : undefined;
+
+  const done = Math.max(completedAudioSeconds, cursor);
+  post({
+    type: 'progress',
+    stage: 'transcribe',
+    value: progressTotalSeconds > 0 ? Math.min(1, done / progressTotalSeconds) : 0,
+    note: `${done.toFixed(0)}s / ${progressTotalSeconds.toFixed(0)}s${progressNoteSuffix}`,
+    speed,
+    etaMs,
+    processedSeconds: done,
+    totalSeconds: progressTotalSeconds,
+  });
+}
+
 /** 两段文字尾部/头部重叠去重（应对 stride 带来的边界重复） */
 function overlapDedup(prev: string, next: string): string {
   const a = prev.split(' ');
@@ -773,6 +828,7 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
     modelSource,
     customModelHost,
     siteBase,
+    resumeFrom,
   } = msg;
   const totalSeconds = audio.length / 16000;
 
@@ -908,12 +964,20 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
   });
 
   const raw: RawSegment[] = [];
-  let cursor = 0;
+  // 续跑：从上次中断的时间点开始，但进度条仍按"整段视频"显示
+  const startAt = Math.max(0, Math.min(resumeFrom ?? 0, Math.max(0, totalSeconds - 0.1)));
+  let cursor = startAt;
   let guard = 0;
   let filteredCount = 0;
   let skippedSilentChunks = 0;
   /** 一旦某个语言真正产出了内容，后续分片就沿用它，避免在错误候选上反复浪费 */
   let lockedLang: string | null = null;
+  /** 中转存档：每处理若干分片上报一次，主线程落盘，中断后可续跑 */
+  let chunksSinceCheckpoint = 0;
+  const CHECKPOINT_EVERY_CHUNKS = 6;
+
+  startProgressClock(totalSeconds, startAt);
+  emitTranscribeProgress(cursor, true);
 
   while (cursor < totalSeconds - 0.05 && !aborted) {
     guard++;
@@ -923,6 +987,9 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
     const from = Math.max(0, Math.floor(cursor * 16000));
     const to = Math.min(audio.length, Math.ceil(end * 16000));
     const slice = audio.subarray(from, to);
+
+    // 本片开始就报一次：长视频里"分片之间"是唯一能让界面动起来的时机
+    emitTranscribeProgress(cursor, true);
 
     // 严格前进，避免死循环
     const minStep = Math.max(0.5, Math.min(strideSeconds, chunkSeconds * 0.9));
@@ -934,12 +1001,9 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
       if (!(next > cursor)) next = cursor + minStep;
       if (totalSeconds - next < Math.min(minStep, 1)) break;
       cursor = next;
-      post({
-        type: 'progress',
-        stage: 'transcribe',
-        value: Math.min(1, end / totalSeconds),
-        note: `${cursor.toFixed(0)}s / ${totalSeconds.toFixed(0)}s · 静音段已跳过`,
-      });
+      completedAudioSeconds = Math.max(completedAudioSeconds, end);
+      progressNoteSuffix = ' · 静音段已跳过';
+      emitTranscribeProgress(cursor, true);
       continue;
     }
 
@@ -1018,13 +1082,9 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
       });
     }
 
-    const progress = Math.min(1, end / totalSeconds);
-    post({
-      type: 'progress',
-      stage: 'transcribe',
-      value: progress,
-      note: `${cursor.toFixed(0)}s / ${totalSeconds.toFixed(0)}s`,
-    });
+    completedAudioSeconds = Math.max(completedAudioSeconds, end);
+    progressNoteSuffix = '';
+    emitTranscribeProgress(cursor, true);
 
     // 计算下一个切片起点。无论走哪条分支，都必须严格前进，否则会死循环。
     let next: number;
@@ -1037,8 +1097,24 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
     }
     if (!(next > cursor)) next = cursor + minStep;
     // 距离末尾不足一个最小步长时直接收尾，避免最后反复扫同一小段
-    if (totalSeconds - next < Math.min(minStep, 1)) break;
+    if (totalSeconds - next < Math.min(minStep, 1)) {
+      cursor = totalSeconds; // 视为跑完，进度条要走到 100%
+      break;
+    }
     cursor = next;
+
+    // 定期存档：中断/刷新后可以从中断处续跑，长视频不必从零重来
+    chunksSinceCheckpoint++;
+    if (chunksSinceCheckpoint >= CHECKPOINT_EVERY_CHUNKS) {
+      chunksSinceCheckpoint = 0;
+      post({
+        type: 'checkpoint',
+        segments: raw,
+        cursor,
+        duration: totalSeconds,
+        language: lockedLang ?? undefined,
+      });
+    }
   }
 
   // 全片兜底：同一句话一字不差出现 4 次以上，基本只可能是幻觉循环（真实语音不会这样）
@@ -1077,6 +1153,12 @@ self.onmessage = async (event: MessageEvent<WorkerInMessage>) => {
     aborted = false;
     try {
       post({ type: 'status', message: '开始语音识别…' });
+      if (msg.resumeFrom && msg.resumeFrom > 0) {
+        post({
+          type: 'status',
+          message: `从中断处继续：已跳过前 ${Math.round(msg.resumeFrom)} 秒，不需要重新识别`,
+        });
+      }
       post({ type: 'progress', stage: 'transcribe', value: 0, note: '0%' });
       await transcribe(msg);
     } catch (err) {

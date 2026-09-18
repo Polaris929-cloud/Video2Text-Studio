@@ -14,7 +14,19 @@ export interface TranscribeCallbacks {
     note?: string;
     /** 加载阶段细分，界面据此区分「下载中」与「编译初始化中」 */
     phase?: 'probe' | 'download' | 'compile';
+    /** 识别速度：处理 1 秒音频需要多少秒（<1 表示比实时快） */
+    speed?: number;
+    /** 预计剩余毫秒 */
+    etaMs?: number;
+    /** 已处理音频秒数 / 总秒数 */
+    processedSeconds?: number;
+    totalSeconds?: number;
   }) => void;
+  /**
+   * 中转存档：长视频识别过程中定期回报已完成内容，
+   * 主线程存下来后，中断/刷新都能接着跑。
+   */
+  onCheckpoint?: (info: { segments: Segment[]; cursor: number; duration: number; language?: string }) => void;
 }
 
 export interface TranscribeResult {
@@ -86,7 +98,7 @@ export class WhisperClient {
     audio: Float32Array,
     settings: AsrSettings,
     callbacks: TranscribeCallbacks = {},
-    options: { preloadOnly?: boolean } = {},
+    options: { preloadOnly?: boolean; resumeFrom?: number } = {},
   ): Promise<TranscribeResult> {
     const worker = this.ensureWorker();
 
@@ -103,7 +115,24 @@ export class WhisperClient {
             callbacks.onStatus?.(msg.message);
             break;
           case 'progress':
-            callbacks.onProgress?.({ stage: msg.stage, value: msg.value, note: msg.note, phase: msg.phase });
+            callbacks.onProgress?.({
+              stage: msg.stage,
+              value: msg.value,
+              note: msg.note,
+              phase: msg.phase,
+              speed: msg.speed,
+              etaMs: msg.etaMs,
+              processedSeconds: msg.processedSeconds,
+              totalSeconds: msg.totalSeconds,
+            });
+            break;
+          case 'checkpoint':
+            callbacks.onCheckpoint?.({
+              segments: normalizeSegments(msg.segments),
+              cursor: msg.cursor,
+              duration: msg.duration,
+              language: msg.language,
+            });
             break;
           case 'result': {
             cleanup();
@@ -153,6 +182,7 @@ export class WhisperClient {
         modelSource: settings.modelSource,
         customModelHost: settings.customModelHost,
         siteBase: resolveSiteBase(document.baseURI),
+        resumeFrom: options.resumeFrom,
       };
       // 用 transferable 传大数组，避免拷贝
       worker.postMessage(payload, [audio.buffer]);

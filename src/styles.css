@@ -300,6 +300,51 @@ select:focus {
   min-width: 0;
 }
 
+/* ---------- 断点续跑提示 ---------- */
+.resume-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  border-color: rgba(79, 124, 255, 0.5);
+  background: linear-gradient(180deg, rgba(79, 124, 255, 0.1), transparent), var(--card);
+}
+
+.resume-card strong {
+  color: #cddcff;
+}
+
+.resume-card .hint {
+  margin: 4px 0 0;
+}
+
+.resume-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* ---------- 识别速度 / 预计剩余 ---------- */
+.speed-note {
+  margin-top: 6px;
+  color: var(--text);
+}
+
+.speed-note strong {
+  color: #9ec1ff;
+  font-variant-numeric: tabular-nums;
+}
+
+.warn-note {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  background: rgba(250, 204, 21, 0.1);
+  border: 1px solid rgba(250, 204, 21, 0.35);
+  color: #ffe9a8;
+}
+
 /* ---------- 拖拽区 ---------- */
 .dropzone {
   text-align: center;

@@ -39,8 +39,27 @@ export type WorkerOutMessage =
       note?: string;
       /** 加载阶段细分：探测来源 / 下载中 / 编译初始化（编译阶段没有百分比可言，界面改用动态条） */
       phase?: 'probe' | 'download' | 'compile';
+      /** 识别速度：每秒音频需要多少秒（越小越快）；<1 表示比实时快 */
+      speed?: number;
+      /** 预计剩余毫秒数 */
+      etaMs?: number;
+      /** 已完成的音频秒数 / 总秒数 */
+      processedSeconds?: number;
+      totalSeconds?: number;
     }
   | { type: 'status'; message: string }
+  | {
+      /**
+       * 中转检查点：长视频识别过程中定期上报已完成内容，
+       * 主线程落盘后，即使中途中断/刷新也能从这里续跑。
+       */
+      type: 'checkpoint';
+      segments: RawSegment[];
+      /** 已经处理到的音频时间点（秒），续跑从这里开始 */
+      cursor: number;
+      duration: number;
+      language?: string;
+    }
   | {
       type: 'result';
       segments: RawSegment[];
@@ -87,6 +106,8 @@ export type WorkerInMessage =
       customModelHost: string;
       /** 站点自带模型目录的绝对地址（主线程算好，同源，最可靠） */
       siteBase: string;
+      /** 续跑起点（秒）。从中断处继续时传入已处理到的时间点 */
+      resumeFrom?: number;
     }
   | { type: 'abort' };
 

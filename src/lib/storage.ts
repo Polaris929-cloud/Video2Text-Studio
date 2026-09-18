@@ -79,3 +79,52 @@ export function saveLastResult(result: PersistedResult | null): void {
     // 结果太大时可能超配额：静默降级，不影响主流程
   }
 }
+
+/* ── 长视频的中转存档 ────────────────────────────────────────────
+ * 37 分钟的视频在 CPU 上要跑几十分钟，中途刷新/关页面/崩溃的概率不低。
+ * 识别过程中每处理若干分片就落一次盘，让用户能从中断处接着跑，
+ * 而不是从头再来一遍（那基本等于放弃）。
+ */
+export interface Checkpoint {
+  fileName: string;
+  /** 已处理到的音频时间点（秒），续跑从这里开始 */
+  cursor: number;
+  /** 音频总时长 */
+  duration: number;
+  segments: Segment[];
+  savedAt: number;
+}
+
+export function loadCheckpoint(): Checkpoint | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.checkpoint);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Checkpoint;
+    if (!parsed || !Array.isArray(parsed.segments) || typeof parsed.cursor !== 'number') return null;
+    // 已经跑完的存档没有续跑价值
+    if (parsed.cursor >= parsed.duration - 1) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function saveCheckpoint(
+  meta: { cursor: number; duration: number; fileName: string },
+  segments: Segment[],
+): void {
+  try {
+    const payload: Checkpoint = { ...meta, segments, savedAt: Date.now() };
+    localStorage.setItem(STORAGE_KEYS.checkpoint, JSON.stringify(payload));
+  } catch {
+    // 超配额（长视频字幕可能很大）：放弃本次落盘，不影响识别本身
+  }
+}
+
+export function clearCheckpoint(): void {
+  try {
+    localStorage.removeItem(STORAGE_KEYS.checkpoint);
+  } catch {
+    /* ignore */
+  }
+}
