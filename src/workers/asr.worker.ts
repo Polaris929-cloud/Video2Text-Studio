@@ -1007,16 +1007,31 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
       continue;
     }
 
-    // 候选语言池：主选 + 若干备选。
-    // 不能只靠"检测胜出的那一个"——背景音乐会"自信地"给出完全错误的答案，
-    // 所以把检测里排前面的语言都留作候选；备选只会在主选一个可用片段都没产出时
-    // 才真正被送去解码，正常情况下不增加开销。
-    const candidates: string[] = [resolved.code, ...resolved.alternates.slice(0, 2)].filter(
-      (code, index, arr) => arr.indexOf(code) === index,
-    );
-    const tryOrder: string[] = lockedLang
-      ? [lockedLang, ...candidates.filter((code) => code !== lockedLang)]
-      : candidates;
+    /*
+     * 候选语言池。
+     *
+     * 为什么要多候选：背景音乐会"自信地"给出完全错误的语言检测结果。
+     *
+     * 但**必须控制代价**：每多试一个候选，就是把同一段音频完整重新推理一遍，
+     * 长视频下这是数倍的耗时。所以这里的策略是：
+     *   1. 用户手动指定了语言 → 只跑这一个。用户已经拍板，反复试探纯属浪费
+     *      （而且手动指定时 expectLang === resolved.code，不会触发幻觉循环，
+     *       不需要"换个语言捞出内容"那套兜底）；
+     *   2. 一旦某个语言产出过内容（lockedLang）→ 后续只用它。
+     *      它已经证明能解码这段音频，再试别的只会白烧时间；
+     *   3. 只有在"语言尚未确定"时，才依次尝试 主选 → 备选。
+     */
+    const manualLanguage = resolved.source === 'manual';
+    let tryOrder: string[];
+    if (manualLanguage) {
+      tryOrder = [resolved.code];
+    } else if (lockedLang) {
+      tryOrder = [lockedLang];
+    } else {
+      tryOrder = [resolved.code, ...resolved.alternates.slice(0, 2)].filter(
+        (code, index, arr) => arr.indexOf(code) === index,
+      );
+    }
 
     let usable: RawSegment[] = [];
     let droppedHere = 0;
@@ -1043,7 +1058,9 @@ async function transcribe(msg: Extract<WorkerInMessage, { type: 'transcribe' }>)
     // （典型的：中文界面下用户在识别英文视频）。仅在整片第一片这么做——
     // 放弃语言判据，只拦跨语系乱码与循环重复，避免一次错误的语言判断
     // 让用户拿到一个彻头彻尾的空结果。
-    if (usable.length === 0 && droppedHere > 0 && cursor === 0) {
+    // 手动指定语言时**不做**这层兜底：用户已经明确选定了语言，
+    // 就不该背着他把整片换成别的语言重跑（长视频下这一下就是成倍耗时）。
+    if (usable.length === 0 && droppedHere > 0 && cursor === 0 && !manualLanguage) {
       for (const lang of tryOrder) {
         const out = await pipe(slice, buildOptions(lang));
         if (aborted) return;
